@@ -570,6 +570,107 @@ class DataFrame:
         plan = LimitNode(self.session._ctx, self.plan, limit)
         return DataFrame(self.session, plan, recompute=self.need_recompute)
 
+    def sample(
+        self,
+        n: Optional[int] = None,
+        fraction: Optional[float] = None,
+        seed: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return a random sample of rows from the DataFrame.
+
+        This is useful for quickly inspecting a representative subset of the data
+        without having to look at all rows. Users can specify either an exact number
+        of rows or a fraction of total rows to sample.
+
+        Parameters
+        ----------
+        n : int, optional
+            The exact number of rows to sample. Must be a positive integer.
+            Cannot be used together with `fraction`.
+            If `n` is larger than the total number of rows in the DataFrame,
+            all available rows will be returned (no error is raised).
+        fraction : float, optional
+            The fraction of rows to sample, between 0.0 and 1.0 (exclusive of 0, inclusive of 1).
+            For example, 0.1 means 10% of rows. Cannot be used together with `n`.
+        seed : int, optional
+            Random seed for reproducible sampling. Can be used with either `n` or `fraction`.
+            If not specified, sampling will be random each time.
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            A list of dictionaries, where each dictionary represents a row with column names as keys.
+
+        Raises
+        ------
+        ValueError
+            If neither `n` nor `fraction` is specified, or if both are specified.
+            If `n` is not a positive integer.
+            If `fraction` is not between 0 and 1.
+
+        Examples
+        --------
+        Sample exactly 5 random rows:
+
+        .. code-block::
+
+            rows = df.sample(n=5)
+
+        Sample 10% of the data:
+
+        .. code-block::
+
+            rows = df.sample(fraction=0.1)
+
+        Sample with a fixed seed for reproducibility (using n):
+
+        .. code-block::
+
+            rows = df.sample(n=10, seed=42)
+
+        Sample with a fixed seed for reproducibility (using fraction):
+
+        .. code-block::
+
+            rows = df.sample(fraction=0.2, seed=42)
+
+        Notes
+        -----
+        This operation triggers execution of the lazy transformations performed on this DataFrame.
+        For very large datasets, using `fraction` with a small value is more efficient than
+        specifying a large `n`, as it can filter rows early in the pipeline.
+        """
+        # Validate parameters
+        if n is None and fraction is None:
+            raise ValueError("Must specify either 'n' (number of rows) or 'fraction' (proportion of rows)")
+        if n is not None and fraction is not None:
+            raise ValueError("Cannot specify both 'n' and 'fraction'. Please choose one.")
+        if n is not None:
+            if not isinstance(n, int) or n <= 0:
+                raise ValueError(f"'n' must be a positive integer, got {n}")
+        if fraction is not None:
+            if not isinstance(fraction, (int, float)) or fraction <= 0 or fraction > 1:
+                raise ValueError(
+                    f"'fraction' must be a decimal number between 0 (exclusive) and 1 (inclusive), got {fraction}. "
+                    "Examples: 0.1 for 10%, 0.25 for 25%, 0.5 for 50%, 1.0 for 100%."
+                )
+
+        # Build sample specification and method based on parameters
+        if fraction is not None:
+            sample_spec = f"{fraction * 100}%"
+            sample_method = "bernoulli"
+        else:
+            sample_spec = f"{n} ROWS"
+            sample_method = "reservoir"
+
+        # Build SQL with optional seed for reproducibility
+        seed_clause = f", repeatable({seed})" if seed is not None else ""
+        sql = f"SELECT * FROM {{0}} USING SAMPLE {sample_spec} ({sample_method}{seed_clause})"
+
+        plan = SqlEngineNode(self.session._ctx, (self.plan,), sql)
+        return DataFrame(self.session, plan, recompute=self.need_recompute).take_all()
+
     def write_parquet(self, path: str) -> None:
         """
         Write data to a series of parquet files under the given path.

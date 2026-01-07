@@ -211,3 +211,91 @@ def test_log(sp: Session):
     # TODO: check logs should be see in the log file
     # FIXME: logs in unit test are not written to the log file
     #        because we share the same ray instance for all tests
+
+
+def test_sample_n(sp: Session):
+    """Test sampling with exact number of rows."""
+    df = sp.from_items(list(range(100)))
+    sample = df.sample(n=5)
+    assert len(sample) == 5
+    # All sampled values should be from the original data
+    for row in sample:
+        assert 0 <= row["item"] < 100
+
+
+def test_sample_n_larger_than_total(sp: Session):
+    """Test that sampling more rows than available returns all rows."""
+    df = sp.from_items(list(range(10)))
+    sample = df.sample(n=100)
+    # Should return at most the total number of rows
+    assert len(sample) <= 10
+
+
+def test_sample_fraction(sp: Session):
+    """Test sampling with fraction of rows."""
+    df = sp.from_items(list(range(1000)))
+    sample = df.sample(fraction=0.1)
+    # With bernoulli sampling, the result is probabilistic
+    # Allow some variance: expect roughly 100 rows (10%), but allow 50-150
+    assert 50 <= len(sample) <= 150
+    # All sampled values should be from the original data
+    for row in sample:
+        assert 0 <= row["item"] < 1000
+
+
+def test_sample_fraction_full(sp: Session):
+    """Test sampling with fraction=1.0 returns all rows."""
+    df = sp.from_items(list(range(50)))
+    sample = df.sample(fraction=1.0)
+    assert len(sample) == 50
+
+
+def test_sample_seed_reproducibility(sp: Session):
+    """Test that same seed produces same sample."""
+    df = sp.from_items(list(range(100)))
+    sample1 = df.sample(n=10, seed=42)
+    sample2 = df.sample(n=10, seed=42)
+    assert sample1 == sample2
+
+
+def test_sample_seed_different_seeds(sp: Session):
+    """Test that different seeds produce different samples."""
+    df = sp.from_items(list(range(100)))
+    sample1 = df.sample(n=10, seed=42)
+    sample2 = df.sample(n=10, seed=123)
+    # Very unlikely to be equal with different seeds
+    assert sample1 != sample2
+
+
+def test_sample_validation_no_params(sp: Session):
+    """Test that sample raises error when neither n nor fraction is specified."""
+    df = sp.from_items([1, 2, 3])
+    with pytest.raises(ValueError, match="Must specify either 'n'.*or 'fraction'"):
+        df.sample()
+
+
+def test_sample_validation_both_params(sp: Session):
+    """Test that sample raises error when both n and fraction are specified."""
+    df = sp.from_items([1, 2, 3])
+    with pytest.raises(ValueError, match="Cannot specify both 'n' and 'fraction'"):
+        df.sample(n=1, fraction=0.5)
+
+
+def test_sample_validation_invalid_n(sp: Session):
+    """Test that sample raises error for invalid n values."""
+    df = sp.from_items([1, 2, 3])
+    with pytest.raises(ValueError, match="'n' must be a positive integer"):
+        df.sample(n=0)
+    with pytest.raises(ValueError, match="'n' must be a positive integer"):
+        df.sample(n=-1)
+
+
+def test_sample_validation_invalid_fraction(sp: Session):
+    """Test that sample raises error for invalid fraction values with helpful examples."""
+    df = sp.from_items([1, 2, 3])
+    with pytest.raises(ValueError, match="'fraction' must be a decimal number.*Examples:.*0.1 for 10%"):
+        df.sample(fraction=0)
+    with pytest.raises(ValueError, match="'fraction' must be a decimal number.*Examples:.*0.25 for 25%"):
+        df.sample(fraction=1.5)
+    with pytest.raises(ValueError, match="'fraction' must be a decimal number.*Examples:.*0.5 for 50%"):
+        df.sample(fraction=-0.1)
