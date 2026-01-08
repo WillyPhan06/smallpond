@@ -299,3 +299,500 @@ def test_sample_validation_invalid_fraction(sp: Session):
         df.sample(fraction=1.5)
     with pytest.raises(ValueError, match="'fraction' must be a decimal number.*Examples:.*0.5 for 50%"):
         df.sample(fraction=-0.1)
+
+
+# ==================== Cache Tests ====================
+
+
+def test_cache_basic(sp: Session):
+    """Test that caching works for basic count() operations."""
+    df = sp.from_items([1, 2, 3])
+
+    # First call should miss cache
+    count1 = df.count()
+    stats1 = sp.get_cache_stats()
+    assert stats1["misses"] == 1
+    assert stats1["hits"] == 0
+
+    # Second call should hit cache
+    count2 = df.count()
+    stats2 = sp.get_cache_stats()
+    assert stats2["hits"] == 1
+    assert stats2["misses"] == 1
+
+    # Results should be the same
+    assert count1 == count2 == 3
+
+
+def test_cache_take(sp: Session):
+    """Test that caching works for take() operations."""
+    df = sp.from_items([1, 2, 3, 4, 5])
+
+    # First take
+    result1 = df.take(3)
+    stats1 = sp.get_cache_stats()
+    assert stats1["misses"] >= 1
+
+    # Second take should use cached result
+    result2 = df.take(3)
+    stats2 = sp.get_cache_stats()
+    assert stats2["hits"] >= 1
+
+
+def test_cache_to_pandas(sp: Session):
+    """Test that caching works for to_pandas() operations."""
+    df = sp.from_items([{"a": 1}, {"a": 2}, {"a": 3}])
+
+    # First call
+    pdf1 = df.to_pandas()
+    stats1 = sp.get_cache_stats()
+    initial_misses = stats1["misses"]
+
+    # Second call should hit cache
+    pdf2 = df.to_pandas()
+    stats2 = sp.get_cache_stats()
+    assert stats2["hits"] >= 1
+
+    assert pdf1.equals(pdf2)
+
+
+def test_cache_disabled_globally(sp: Session):
+    """Test that global cache disable works."""
+    df = sp.from_items([1, 2, 3])
+
+    sp.set_cache_enabled(False)
+
+    # Both calls should not use cache
+    df.count()
+    df.count()
+
+    stats = sp.get_cache_stats()
+    assert stats["hits"] == 0
+    assert stats["enabled"] is False
+
+    # Re-enable for other tests
+    sp.set_cache_enabled(True)
+
+
+def test_cache_disabled_per_dataframe(sp: Session):
+    """Test that no_cache() disables caching for specific DataFrame."""
+    df = sp.from_items([1, 2, 3])
+
+    # Use no_cache() - should not cache
+    df.no_cache().count()
+    df.no_cache().count()
+
+    stats = sp.get_cache_stats()
+    # no_cache() should not add to cache or retrieve from it
+    assert stats["entries"] == 0
+
+
+def test_cache_clear_all(sp: Session):
+    """Test clearing all cache entries."""
+    df1 = sp.from_items([1, 2, 3])
+    df2 = sp.from_items([4, 5, 6])
+
+    # Populate cache
+    df1.count()
+    df2.count()
+
+    stats1 = sp.get_cache_stats()
+    assert stats1["entries"] >= 2
+
+    # Clear all
+    cleared = sp.clear_cache()
+    assert cleared >= 2
+
+    stats2 = sp.get_cache_stats()
+    assert stats2["entries"] == 0
+
+
+def test_cache_clear_specific(sp: Session):
+    """Test clearing cache for a specific DataFrame."""
+    df1 = sp.from_items([1, 2, 3])
+    df2 = sp.from_items([4, 5, 6])
+
+    # Populate cache
+    df1.count()
+    df2.count()
+
+    # Clear only df1's cache
+    df1.clear_cache()
+
+    # df1 should miss, df2 should still hit
+    df1.count()  # Should be a miss (cache was cleared)
+    df2.count()  # Should be a hit
+
+    stats = sp.get_cache_stats()
+    # df1: 1 miss (initial), then cleared, then 1 miss again
+    # df2: 1 miss (initial), then 1 hit
+    assert stats["hits"] >= 1
+
+
+def test_cache_get_entries(sp: Session):
+    """Test getting information about cached entries."""
+    df = sp.from_items([1, 2, 3])
+    df.count()
+
+    entries = sp.get_cached_entries()
+    assert len(entries) >= 1
+    assert "key" in entries[0]
+    assert "cached_at" in entries[0]
+    assert "num_datasets" in entries[0]
+
+
+def test_cache_stats(sp: Session):
+    """Test cache statistics."""
+    df = sp.from_items([1, 2, 3])
+
+    # First call - miss
+    df.count()
+    # Second call - hit
+    df.count()
+
+    stats = sp.get_cache_stats()
+    assert "entries" in stats
+    assert "hits" in stats
+    assert "misses" in stats
+    assert "hit_rate" in stats
+    assert "enabled" in stats
+    assert stats["hits"] >= 1
+    assert stats["misses"] >= 1
+    assert 0 <= stats["hit_rate"] <= 1
+
+
+def test_cache_operations_inherit_setting(sp: Session):
+    """Test that DataFrame operations inherit the cache setting."""
+    df = sp.from_items([1, 2, 3, 4, 5]).no_cache()
+
+    # Filter should also have caching disabled
+    filtered = df.filter("item > 2")
+    assert filtered._use_cache is False
+
+    # Map should also have caching disabled
+    mapped = df.map("item * 2 as doubled")
+    assert mapped._use_cache is False
+
+
+def test_cache_recompute_bypasses_cache(sp: Session):
+    """Test that recompute() bypasses the cache."""
+    df = sp.from_items([1, 2, 3])
+
+    # First call - populates cache
+    count1 = df.count()
+
+    # Second call with recompute - should bypass cache
+    count2 = df.recompute().count()
+
+    # Both should return the same result
+    assert count1 == count2 == 3
+
+
+def test_cache_different_operations_different_keys(sp: Session):
+    """Test that different operations on the same DataFrame have different cache keys."""
+    df = sp.from_items([1, 2, 3, 4, 5])
+
+    # Different operations should have different cache entries
+    df.count()
+    df.filter("item > 2").count()
+    df.map("item * 2 as doubled").count()
+
+    stats = sp.get_cache_stats()
+    # Should have multiple cache entries for different operations
+    assert stats["entries"] >= 3
+
+
+def test_cache_different_parameters_different_keys(sp: Session):
+    """Test that same operations with different parameters create different cache entries."""
+    df = sp.from_items([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+
+    # Same operation (filter) but with different parameters should create different cache entries
+    result1 = df.filter("item > 2").count()
+    result2 = df.filter("item > 5").count()
+    result3 = df.filter("item > 8").count()
+
+    # Results should be different
+    assert result1 == 8  # items 3-10
+    assert result2 == 5  # items 6-10
+    assert result3 == 2  # items 9-10
+
+    stats = sp.get_cache_stats()
+    # Should have 3 different cache entries for different filter conditions
+    assert stats["entries"] == 3
+    # All 3 should be misses (first time computing each)
+    assert stats["misses"] == 3
+    assert stats["hits"] == 0
+
+    # Now call the same operations again - should hit cache
+    result1_cached = df.filter("item > 2").count()
+    result2_cached = df.filter("item > 5").count()
+    result3_cached = df.filter("item > 8").count()
+
+    # Results should be the same
+    assert result1_cached == result1
+    assert result2_cached == result2
+    assert result3_cached == result3
+
+    stats = sp.get_cache_stats()
+    # Should have 3 hits now
+    assert stats["hits"] == 3
+
+
+def test_cache_same_operation_same_key(sp: Session):
+    """Test that identical operations create the same cache key and hit cache."""
+    df = sp.from_items([1, 2, 3])
+
+    # Two identical filter operations should use the same cache entry
+    result1 = df.filter("item > 1").count()
+    result2 = df.filter("item > 1").count()
+
+    assert result1 == result2 == 2
+
+    stats = sp.get_cache_stats()
+    # Should have 1 miss (first call) and 1 hit (second call)
+    assert stats["misses"] == 1
+    assert stats["hits"] == 1
+    assert stats["entries"] == 1
+
+
+def test_cache_limit_different_values(sp: Session):
+    """Test that limit() with different values creates different cache entries."""
+    df = sp.from_items(list(range(100)))
+
+    # Different limit values should create different cache entries
+    count1 = df.limit(10).count()
+    count2 = df.limit(20).count()
+    count3 = df.limit(30).count()
+
+    assert count1 == 10
+    assert count2 == 20
+    assert count3 == 30
+
+    stats = sp.get_cache_stats()
+    # Should have 3 different cache entries
+    assert stats["entries"] == 3
+
+
+def test_cache_thread_safety(sp: Session):
+    """Test that concurrent _compute() calls are thread-safe."""
+    import threading
+
+    df = sp.from_items(list(range(100)))
+
+    results = []
+    errors = []
+
+    def compute_count():
+        try:
+            count = df.count()
+            results.append(count)
+        except Exception as e:
+            errors.append(e)
+
+    # Run multiple threads concurrently
+    threads = [threading.Thread(target=compute_count) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # All threads should succeed
+    assert len(errors) == 0
+    # All results should be the same
+    assert all(r == 100 for r in results)
+
+    stats = sp.get_cache_stats()
+    # Should have 1 miss (first computation) and 4 hits (cached results)
+    # Note: due to threading, there might be slight variations
+    assert stats["entries"] == 1
+    assert stats["hits"] + stats["misses"] == 5
+
+
+def test_cache_recompute_clears_cache(sp: Session):
+    """Test that recompute() clears the cached result to free memory."""
+    df = sp.from_items([1, 2, 3])
+
+    # First call - populates cache
+    count1 = df.count()
+
+    stats1 = sp.get_cache_stats()
+    assert stats1["entries"] == 1
+    assert stats1["misses"] == 1
+
+    # Call recompute() - should clear the cache entry
+    df.recompute()
+
+    stats2 = sp.get_cache_stats()
+    # Cache entry should be cleared
+    assert stats2["entries"] == 0
+
+    # Now count again - should be a miss since cache was cleared
+    count2 = df.count()
+
+    stats3 = sp.get_cache_stats()
+    # Should have 1 new entry and 2 total misses (original + after recompute)
+    assert stats3["entries"] == 1
+    assert stats3["misses"] == 2
+
+    # Results should still be the same
+    assert count1 == count2 == 3
+
+
+def test_cache_recompute_on_uncomputed_dataframe(sp: Session):
+    """Test that recompute() works correctly on a DataFrame that hasn't been computed yet."""
+    df = sp.from_items([1, 2, 3])
+
+    # Call recompute() before any computation
+    # This should not raise an error even though optimized_plan is None
+    df.recompute()
+
+    stats = sp.get_cache_stats()
+    # No cache entries should exist
+    assert stats["entries"] == 0
+
+    # Now compute - should work normally
+    count = df.count()
+    assert count == 3
+
+    stats2 = sp.get_cache_stats()
+    # Should have 1 entry now
+    assert stats2["entries"] == 1
+
+
+def test_cache_key_generation_with_complex_data(sp: Session):
+    """Test that cache key generation handles complex/nested data structures."""
+    # Create DataFrames with various complex operations
+    df = sp.from_items([{"a": 1, "b": {"nested": "value"}}, {"a": 2, "b": {"nested": "other"}}])
+
+    # Should be able to compute without errors
+    count = df.count()
+    assert count == 2
+
+    stats = sp.get_cache_stats()
+    assert stats["entries"] >= 1
+
+
+def test_cache_key_generation_with_special_characters(sp: Session):
+    """Test that cache key generation handles SQL with special characters."""
+    df = sp.from_items([1, 2, 3, 4, 5])
+
+    # Filter with special characters in SQL
+    result1 = df.filter("item >= 2 AND item <= 4").count()
+    result2 = df.filter("item >= 2 AND item <= 4").count()
+
+    # Should return same results and hit cache
+    assert result1 == result2 == 3
+
+    stats = sp.get_cache_stats()
+    assert stats["hits"] >= 1
+
+
+def test_cache_max_entries_eviction(sp: Session):
+    """Test that cache evicts oldest entries when max_entries is reached."""
+    from smallpond.dataframe import DataFrameCache
+
+    # Create a cache with max 2 entries
+    limited_cache = DataFrameCache(max_entries=2)
+    sp._cache = limited_cache
+
+    df = sp.from_items(list(range(10)))
+
+    # Create 3 different operations - should evict the first one
+    df.filter("item > 1").count()
+    df.filter("item > 2").count()
+    df.filter("item > 3").count()
+
+    stats = sp.get_cache_stats()
+    # Should only have 2 entries due to max_entries limit
+    assert stats["entries"] == 2
+
+
+def test_cache_empty_dataframe(sp: Session):
+    """Test caching works correctly with empty DataFrames."""
+    df = sp.from_items([])
+
+    count1 = df.count()
+    count2 = df.count()
+
+    # Both should return 0
+    assert count1 == count2 == 0
+
+    stats = sp.get_cache_stats()
+    # Should have 1 hit (second call)
+    assert stats["hits"] >= 1
+
+
+def test_cache_stats_reset(sp: Session):
+    """Test that cache stats can be reset independently of cache entries."""
+    df = sp.from_items([1, 2, 3])
+
+    # Generate some hits and misses
+    df.count()  # miss
+    df.count()  # hit
+
+    stats1 = sp.get_cache_stats()
+    assert stats1["hits"] == 1
+    assert stats1["misses"] == 1
+
+    # Reset stats but keep cache entries
+    sp.cache.reset_stats()
+
+    stats2 = sp.get_cache_stats()
+    # Stats should be reset
+    assert stats2["hits"] == 0
+    assert stats2["misses"] == 0
+    # But entries should still exist
+    assert stats2["entries"] == 1
+
+    # Next call should still hit cache
+    df.count()
+
+    stats3 = sp.get_cache_stats()
+    assert stats3["hits"] == 1
+    assert stats3["misses"] == 0
+
+
+def test_cache_hit_rate_calculation(sp: Session):
+    """Test that cache hit rate is calculated correctly."""
+    df = sp.from_items([1, 2, 3])
+
+    # 1 miss
+    df.count()
+
+    stats1 = sp.get_cache_stats()
+    assert stats1["hit_rate"] == 0.0  # 0 hits / 1 total
+
+    # 1 hit
+    df.count()
+
+    stats2 = sp.get_cache_stats()
+    assert stats2["hit_rate"] == 0.5  # 1 hit / 2 total
+
+    # 1 more hit
+    df.count()
+
+    stats3 = sp.get_cache_stats()
+    assert abs(stats3["hit_rate"] - 2/3) < 0.01  # 2 hits / 3 total
+
+
+def test_cache_multiple_dataframes_same_session(sp: Session):
+    """Test that multiple DataFrames in the same session share the cache correctly."""
+    df1 = sp.from_items([1, 2, 3])
+    df2 = sp.from_items([4, 5, 6])
+
+    # Both should be cached separately
+    count1 = df1.count()
+    count2 = df2.count()
+
+    assert count1 == 3
+    assert count2 == 3
+
+    stats = sp.get_cache_stats()
+    assert stats["entries"] == 2
+
+    # Both should hit cache on second call
+    df1.count()
+    df2.count()
+
+    stats2 = sp.get_cache_stats()
+    assert stats2["hits"] == 2

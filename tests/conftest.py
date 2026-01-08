@@ -4,6 +4,7 @@ import pytest
 import ray
 
 import smallpond
+from smallpond.dataframe import get_default_cache
 
 
 @pytest.fixture(scope="session")
@@ -21,6 +22,12 @@ def ray_address():
 @pytest.fixture
 def sp(ray_address: str, request):
     """A smallpond session for each test"""
+    # Clear global cache before each test to ensure test isolation
+    cache = get_default_cache()
+    cache.invalidate()
+    cache.reset_stats()
+    cache.enabled = True  # Ensure caching is enabled
+
     runtime_root = os.getenv("TEST_RUNTIME_ROOT") or f"tests/runtime"
     sp = smallpond.init(
         data_root=os.path.join(runtime_root, request.node.name),
