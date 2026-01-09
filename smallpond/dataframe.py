@@ -1243,6 +1243,253 @@ class DataFrame:
             # before joining using map() to avoid ambiguity.
             return f"SELECT __left__.*, __right__.* FROM {{0}} AS __left__ {join_clause} {{1}} AS __right__{on_clause}"
 
+    def groupby_agg(
+        self,
+        by: Union[str, List[str]],
+        aggs: Dict[str, Union[str, List[str]]],
+        npartitions: Optional[int] = None,
+    ) -> DataFrame:
+        """
+        Perform grouped aggregation on the DataFrame.
+
+        This method groups the data by specified columns and computes aggregations
+        on other columns. It automatically handles repartitioning by group keys and
+        merges partial results across partitions correctly.
+
+        Parameters
+        ----------
+        by : str or List[str]
+            Column name(s) to group by.
+        aggs : Dict[str, Union[str, List[str]]]
+            A dictionary mapping column names to aggregation function(s).
+            Keys are the column names to aggregate (must not overlap with `by` columns).
+            Values can be a single aggregation function name (str) or a list of functions.
+            Supported aggregation functions:
+            - 'count': Count non-null values
+            - 'sum': Sum of values
+            - 'avg' or 'mean': Average of values
+            - 'min': Minimum value
+            - 'max': Maximum value
+            - 'count_distinct': Count of distinct values. WARNING: This collects all
+              distinct values in memory during the two-phase aggregation. Avoid using
+              on columns with very high cardinality (millions of unique values) as it
+              may cause memory issues.
+        npartitions : int, optional
+            Number of partitions to use for the partial aggregation phase. If not
+            specified, uses the current number of partitions. This controls parallelism
+            during the first phase where data is hash-partitioned by group keys and
+            partial aggregates are computed per partition. The final aggregation phase
+            always collects results into a single partition to combine partial results.
+
+        Returns
+        -------
+        DataFrame
+            A new DataFrame containing the grouped aggregation results.
+            Output columns will be named as:
+            - Group columns: original column names
+            - Aggregated columns: '<column>_<agg_func>' (e.g., 'amount_sum', 'price_avg')
+
+        Raises
+        ------
+        ValueError
+            If `by` is empty, if an unsupported aggregation function is specified,
+            or if any column appears in both `by` and `aggs`.
+
+        Examples
+        --------
+        Single aggregation per column:
+
+        .. code-block::
+
+            result = df.groupby_agg(
+                by='category',
+                aggs={'amount': 'sum', 'price': 'avg'}
+            )
+
+        Multiple aggregations per column:
+
+        .. code-block::
+
+            result = df.groupby_agg(
+                by=['region', 'category'],
+                aggs={'amount': ['sum', 'count'], 'price': ['min', 'max', 'avg']}
+            )
+
+        Notes
+        -----
+        - This method uses a two-phase aggregation strategy:
+          1. **Partial aggregation**: Data is hash-partitioned by group columns (using
+             `npartitions`), and partial aggregates are computed in parallel per partition.
+          2. **Final aggregation**: All partial results are collected into a single partition
+             and combined to produce the final result.
+        - For 'avg', partial sums and counts are computed separately, then combined as
+          sum(partial_sums) / sum(partial_counts) to ensure correct weighted averages.
+        - **Memory warning for 'count_distinct'**: This aggregation collects all distinct
+          values per group into lists during partial aggregation. For columns with very
+          high cardinality (millions of unique values), this can cause memory pressure.
+          Consider using approximate distinct count techniques for such cases.
+        """
+        # Validate and normalize 'by' parameter
+        if isinstance(by, str):
+            group_cols = [by]
+        else:
+            group_cols = list(by)
+
+        if not group_cols:
+            raise ValueError("'by' parameter cannot be empty")
+
+        # Validate and normalize 'aggs' parameter
+        if not aggs:
+            raise ValueError("'aggs' parameter cannot be empty")
+
+        # Check for overlapping columns between group by and aggregation
+        group_cols_set = set(group_cols)
+        agg_cols_set = set(aggs.keys())
+        overlapping_cols = group_cols_set & agg_cols_set
+        if overlapping_cols:
+            raise ValueError(
+                f"Columns cannot be used for both grouping and aggregation: {sorted(overlapping_cols)}. "
+                "A column should either be grouped by OR aggregated, not both."
+            )
+
+        supported_aggs = {'count', 'sum', 'avg', 'mean', 'min', 'max', 'count_distinct'}
+        normalized_aggs: Dict[str, List[str]] = {}
+
+        for col, funcs in aggs.items():
+            if isinstance(funcs, str):
+                funcs_list = [funcs]
+            else:
+                funcs_list = list(funcs)
+
+            for func in funcs_list:
+                func_lower = func.lower()
+                if func_lower not in supported_aggs:
+                    raise ValueError(
+                        f"Unsupported aggregation function '{func}'. "
+                        f"Supported functions are: {', '.join(sorted(supported_aggs))}"
+                    )
+
+            normalized_aggs[col] = funcs_list
+
+        # Determine number of partitions
+        if npartitions is None:
+            npartitions = self.plan.num_partitions
+
+        # Repartition by group columns to ensure all rows with same group keys
+        # are in the same partition
+        grouped_df = self.repartition(npartitions, hash_by=group_cols)
+
+        # Build aggregation SQL and execute
+        # We use a two-phase approach for correctness:
+        # Phase 1: Compute partial aggregates per partition
+        # Phase 2: Combine partial results
+
+        partial_agg_sql, final_agg_sql = self._build_groupby_agg_sql(group_cols, normalized_aggs)
+
+        # Phase 1: Partial aggregation per partition
+        partial_plan = SqlEngineNode(
+            self.session._ctx,
+            (grouped_df.plan,),
+            partial_agg_sql,
+        )
+        partial_df = DataFrame(self.session, partial_plan, recompute=self.need_recompute, use_cache=self._use_cache)
+
+        # Phase 2: Collect all partial results into a single partition and compute final aggregates
+        # Use repartition(1) to collect all partial results, then apply final aggregation
+        collected_df = partial_df.repartition(1)
+
+        final_plan = SqlEngineNode(
+            self.session._ctx,
+            (collected_df.plan,),
+            final_agg_sql,
+        )
+
+        return DataFrame(self.session, final_plan, recompute=self.need_recompute, use_cache=self._use_cache)
+
+    def _build_groupby_agg_sql(
+        self,
+        group_cols: List[str],
+        aggs: Dict[str, List[str]],
+    ) -> Tuple[str, str]:
+        """
+        Build SQL queries for two-phase grouped aggregation.
+
+        Parameters
+        ----------
+        group_cols : List[str]
+            Column names to group by.
+        aggs : Dict[str, List[str]]
+            Mapping of column names to list of aggregation functions.
+
+        Returns
+        -------
+        Tuple[str, str]
+            A tuple of (partial_sql, final_sql) for the two aggregation phases.
+        """
+        # Quote column names for SQL
+        quoted_group_cols = [f'"{col}"' for col in group_cols]
+        group_by_clause = ", ".join(quoted_group_cols)
+
+        # Build partial and final aggregation expressions
+        partial_select_parts = list(quoted_group_cols)
+        final_select_parts = list(quoted_group_cols)
+
+        for col, funcs in aggs.items():
+            quoted_col = f'"{col}"'
+            for func in funcs:
+                func_lower = func.lower()
+                output_name = f"{col}_{func_lower}"
+                quoted_output = f'"{output_name}"'
+
+                if func_lower in ('count',):
+                    # COUNT: sum of partial counts
+                    partial_select_parts.append(f"COUNT({quoted_col}) AS {quoted_output}")
+                    final_select_parts.append(f"SUM({quoted_output}) AS {quoted_output}")
+
+                elif func_lower in ('sum',):
+                    # SUM: sum of partial sums
+                    partial_select_parts.append(f"SUM({quoted_col}) AS {quoted_output}")
+                    final_select_parts.append(f"SUM({quoted_output}) AS {quoted_output}")
+
+                elif func_lower in ('min',):
+                    # MIN: min of partial mins
+                    partial_select_parts.append(f"MIN({quoted_col}) AS {quoted_output}")
+                    final_select_parts.append(f"MIN({quoted_output}) AS {quoted_output}")
+
+                elif func_lower in ('max',):
+                    # MAX: max of partial maxes
+                    partial_select_parts.append(f"MAX({quoted_col}) AS {quoted_output}")
+                    final_select_parts.append(f"MAX({quoted_output}) AS {quoted_output}")
+
+                elif func_lower in ('avg', 'mean'):
+                    # AVG: requires sum and count, then sum(sum)/sum(count)
+                    sum_name = f"{col}__avg_sum"
+                    count_name = f"{col}__avg_count"
+                    # Normalize output name to 'avg' even if user specified 'mean'
+                    output_name = f"{col}_avg"
+                    quoted_output = f'"{output_name}"'
+
+                    partial_select_parts.append(f'SUM({quoted_col}) AS "{sum_name}"')
+                    partial_select_parts.append(f'COUNT({quoted_col}) AS "{count_name}"')
+                    final_select_parts.append(f'SUM("{sum_name}") / SUM("{count_name}") AS {quoted_output}')
+
+                elif func_lower == 'count_distinct':
+                    # COUNT_DISTINCT: collect distinct values per partition, then count distinct in final
+                    # We use a list aggregation approach: collect values, then flatten and count distinct
+                    list_name = f"{col}__distinct_list"
+                    partial_select_parts.append(f'LIST(DISTINCT {quoted_col}) AS "{list_name}"')
+                    final_select_parts.append(
+                        f'(SELECT COUNT(DISTINCT val) FROM (SELECT UNNEST(LIST("{list_name}")) AS val)) AS {quoted_output}'
+                    )
+
+        partial_select = ", ".join(partial_select_parts)
+        final_select = ", ".join(final_select_parts)
+
+        partial_sql = f"SELECT {partial_select} FROM {{0}} GROUP BY {group_by_clause}"
+        final_sql = f"SELECT {final_select} FROM {{0}} GROUP BY {group_by_clause}"
+
+        return partial_sql, final_sql
+
     def sample(
         self,
         n: Optional[int] = None,

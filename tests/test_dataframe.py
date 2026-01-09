@@ -1153,3 +1153,271 @@ def test_cache_multiple_dataframes_same_session(sp: Session):
 
     stats2 = sp.get_cache_stats()
     assert stats2["hits"] == 2
+
+
+# ==================== GroupBy Aggregation Tests ====================
+
+
+def test_groupby_agg_single_column_single_agg(sp: Session):
+    """Test groupby with single group column and single aggregation."""
+    df = sp.from_arrow(pa.table({
+        "category": ["A", "A", "B", "B", "B"],
+        "value": [10, 20, 30, 40, 50]
+    }))
+    result = df.groupby_agg(by="category", aggs={"value": "sum"})
+    rows = sorted(result.take_all(), key=lambda x: x["category"])
+
+    assert len(rows) == 2
+    assert rows[0]["category"] == "A"
+    assert rows[0]["value_sum"] == 30  # 10 + 20
+    assert rows[1]["category"] == "B"
+    assert rows[1]["value_sum"] == 120  # 30 + 40 + 50
+
+
+def test_groupby_agg_single_column_multiple_aggs(sp: Session):
+    """Test groupby with single group column and multiple aggregations."""
+    df = sp.from_arrow(pa.table({
+        "category": ["A", "A", "B", "B"],
+        "value": [10, 20, 30, 40]
+    }))
+    result = df.groupby_agg(by="category", aggs={"value": ["sum", "count", "min", "max"]})
+    rows = sorted(result.take_all(), key=lambda x: x["category"])
+
+    assert len(rows) == 2
+    # Category A
+    assert rows[0]["category"] == "A"
+    assert rows[0]["value_sum"] == 30
+    assert rows[0]["value_count"] == 2
+    assert rows[0]["value_min"] == 10
+    assert rows[0]["value_max"] == 20
+    # Category B
+    assert rows[1]["category"] == "B"
+    assert rows[1]["value_sum"] == 70
+    assert rows[1]["value_count"] == 2
+    assert rows[1]["value_min"] == 30
+    assert rows[1]["value_max"] == 40
+
+
+def test_groupby_agg_multiple_columns(sp: Session):
+    """Test groupby with multiple group columns."""
+    df = sp.from_arrow(pa.table({
+        "region": ["East", "East", "West", "West"],
+        "category": ["A", "B", "A", "B"],
+        "value": [10, 20, 30, 40]
+    }))
+    result = df.groupby_agg(by=["region", "category"], aggs={"value": "sum"})
+    rows = sorted(result.take_all(), key=lambda x: (x["region"], x["category"]))
+
+    assert len(rows) == 4
+    assert rows[0] == {"region": "East", "category": "A", "value_sum": 10}
+    assert rows[1] == {"region": "East", "category": "B", "value_sum": 20}
+    assert rows[2] == {"region": "West", "category": "A", "value_sum": 30}
+    assert rows[3] == {"region": "West", "category": "B", "value_sum": 40}
+
+
+def test_groupby_agg_multiple_value_columns(sp: Session):
+    """Test groupby aggregating multiple value columns."""
+    df = sp.from_arrow(pa.table({
+        "category": ["A", "A", "B", "B"],
+        "sales": [100, 200, 300, 400],
+        "quantity": [1, 2, 3, 4]
+    }))
+    result = df.groupby_agg(by="category", aggs={"sales": "sum", "quantity": "sum"})
+    rows = sorted(result.take_all(), key=lambda x: x["category"])
+
+    assert len(rows) == 2
+    assert rows[0]["category"] == "A"
+    assert rows[0]["sales_sum"] == 300
+    assert rows[0]["quantity_sum"] == 3
+    assert rows[1]["category"] == "B"
+    assert rows[1]["sales_sum"] == 700
+    assert rows[1]["quantity_sum"] == 7
+
+
+def test_groupby_agg_avg(sp: Session):
+    """Test groupby with avg aggregation (requires two-phase computation)."""
+    df = sp.from_arrow(pa.table({
+        "category": ["A", "A", "A", "B", "B"],
+        "value": [10, 20, 30, 40, 60]
+    }))
+    result = df.groupby_agg(by="category", aggs={"value": "avg"})
+    rows = sorted(result.take_all(), key=lambda x: x["category"])
+
+    assert len(rows) == 2
+    assert rows[0]["category"] == "A"
+    assert rows[0]["value_avg"] == 20.0  # (10 + 20 + 30) / 3
+    assert rows[1]["category"] == "B"
+    assert rows[1]["value_avg"] == 50.0  # (40 + 60) / 2
+
+
+def test_groupby_agg_mean_alias(sp: Session):
+    """Test that 'mean' is accepted as alias for 'avg'."""
+    df = sp.from_arrow(pa.table({
+        "category": ["A", "A", "B", "B"],
+        "value": [10, 20, 30, 40]
+    }))
+    result = df.groupby_agg(by="category", aggs={"value": "mean"})
+    rows = sorted(result.take_all(), key=lambda x: x["category"])
+
+    assert len(rows) == 2
+    # Output column should be named 'value_avg' even when 'mean' is specified
+    assert rows[0]["value_avg"] == 15.0
+    assert rows[1]["value_avg"] == 35.0
+
+
+def test_groupby_agg_count_distinct(sp: Session):
+    """Test groupby with count_distinct aggregation."""
+    df = sp.from_arrow(pa.table({
+        "category": ["A", "A", "A", "B", "B", "B"],
+        "value": [1, 1, 2, 3, 3, 3]  # A has 2 distinct, B has 1 distinct
+    }))
+    result = df.groupby_agg(by="category", aggs={"value": "count_distinct"})
+    rows = sorted(result.take_all(), key=lambda x: x["category"])
+
+    assert len(rows) == 2
+    assert rows[0]["category"] == "A"
+    assert rows[0]["value_count_distinct"] == 2
+    assert rows[1]["category"] == "B"
+    assert rows[1]["value_count_distinct"] == 1
+
+
+def test_groupby_agg_with_partitions(sp: Session):
+    """Test groupby correctly handles data across multiple partitions."""
+    # Create data that will be distributed across partitions
+    items = [{"category": chr(65 + (i % 3)), "value": i} for i in range(100)]
+    df = sp.from_items(items).repartition(5, by_rows=True)
+
+    result = df.groupby_agg(by="category", aggs={"value": ["sum", "count"]}, npartitions=3)
+    rows = sorted(result.take_all(), key=lambda x: x["category"])
+
+    assert len(rows) == 3  # A, B, C
+    # Verify counts add up
+    total_count = sum(r["value_count"] for r in rows)
+    assert total_count == 100
+
+    # A: 0, 3, 6, ..., 99 (34 items) -> sum = 0+3+6+...+99
+    # B: 1, 4, 7, ..., 97 (33 items) -> sum = 1+4+7+...+97
+    # C: 2, 5, 8, ..., 98 (33 items) -> sum = 2+5+8+...+98
+    a_values = [i for i in range(100) if i % 3 == 0]
+    b_values = [i for i in range(100) if i % 3 == 1]
+    c_values = [i for i in range(100) if i % 3 == 2]
+
+    assert rows[0]["category"] == "A"
+    assert rows[0]["value_sum"] == sum(a_values)
+    assert rows[0]["value_count"] == len(a_values)
+
+    assert rows[1]["category"] == "B"
+    assert rows[1]["value_sum"] == sum(b_values)
+    assert rows[1]["value_count"] == len(b_values)
+
+    assert rows[2]["category"] == "C"
+    assert rows[2]["value_sum"] == sum(c_values)
+    assert rows[2]["value_count"] == len(c_values)
+
+
+def test_groupby_agg_validation_empty_by(sp: Session):
+    """Test that empty 'by' parameter raises ValueError."""
+    df = sp.from_items([{"a": 1, "b": 2}])
+    with pytest.raises(ValueError, match="'by' parameter cannot be empty"):
+        df.groupby_agg(by=[], aggs={"b": "sum"})
+
+
+def test_groupby_agg_validation_empty_aggs(sp: Session):
+    """Test that empty 'aggs' parameter raises ValueError."""
+    df = sp.from_items([{"a": 1, "b": 2}])
+    with pytest.raises(ValueError, match="'aggs' parameter cannot be empty"):
+        df.groupby_agg(by="a", aggs={})
+
+
+def test_groupby_agg_validation_unsupported_agg(sp: Session):
+    """Test that unsupported aggregation function raises ValueError."""
+    df = sp.from_items([{"a": 1, "b": 2}])
+    with pytest.raises(ValueError, match="Unsupported aggregation function 'median'"):
+        df.groupby_agg(by="a", aggs={"b": "median"})
+
+
+def test_groupby_agg_validation_overlapping_columns(sp: Session):
+    """Test that using the same column for both grouping and aggregation raises ValueError."""
+    df = sp.from_items([{"a": 1, "b": 2, "c": 3}])
+    # Single overlapping column
+    with pytest.raises(ValueError, match="Columns cannot be used for both grouping and aggregation"):
+        df.groupby_agg(by="a", aggs={"a": "sum"})
+    # Multiple group columns with one overlapping
+    with pytest.raises(ValueError, match="Columns cannot be used for both grouping and aggregation.*'b'"):
+        df.groupby_agg(by=["a", "b"], aggs={"b": "count", "c": "sum"})
+
+
+def test_groupby_agg_preserves_cache_setting(sp: Session):
+    """Test that groupby_agg inherits the cache setting."""
+    df = sp.from_arrow(pa.table({"a": [1, 2], "b": [3, 4]})).no_cache()
+    result = df.groupby_agg(by="a", aggs={"b": "sum"})
+    assert result._use_cache is False
+
+
+def test_groupby_agg_all_aggregations_combined(sp: Session):
+    """Test combining all supported aggregation types in a single call."""
+    df = sp.from_arrow(pa.table({
+        "category": ["A", "A", "A", "B", "B"],
+        "x": [1, 2, 3, 4, 5],
+        "y": [10, 10, 20, 30, 30]
+    }))
+    result = df.groupby_agg(
+        by="category",
+        aggs={
+            "x": ["sum", "count", "min", "max", "avg"],
+            "y": "count_distinct"
+        }
+    )
+    rows = sorted(result.take_all(), key=lambda x: x["category"])
+
+    assert len(rows) == 2
+
+    # Category A: x=[1,2,3], y=[10,10,20]
+    assert rows[0]["category"] == "A"
+    assert rows[0]["x_sum"] == 6
+    assert rows[0]["x_count"] == 3
+    assert rows[0]["x_min"] == 1
+    assert rows[0]["x_max"] == 3
+    assert rows[0]["x_avg"] == 2.0
+    assert rows[0]["y_count_distinct"] == 2  # 10 and 20
+
+    # Category B: x=[4,5], y=[30,30]
+    assert rows[1]["category"] == "B"
+    assert rows[1]["x_sum"] == 9
+    assert rows[1]["x_count"] == 2
+    assert rows[1]["x_min"] == 4
+    assert rows[1]["x_max"] == 5
+    assert rows[1]["x_avg"] == 4.5
+    assert rows[1]["y_count_distinct"] == 1  # only 30
+
+
+def test_groupby_agg_large_dataset_correctness(sp: Session):
+    """Test groupby_agg correctness with a larger dataset distributed across partitions."""
+    # Create 1000 rows distributed across 10 partitions
+    items = [
+        {"group": f"G{i % 10}", "value": i, "other": i * 2}
+        for i in range(1000)
+    ]
+    df = sp.from_items(items).repartition(10, by_rows=True)
+
+    result = df.groupby_agg(
+        by="group",
+        aggs={"value": ["sum", "count", "avg"], "other": "max"},
+        npartitions=5
+    )
+    rows = sorted(result.take_all(), key=lambda x: x["group"])
+
+    assert len(rows) == 10  # G0 through G9
+
+    # Verify each group
+    for i, row in enumerate(rows):
+        group_name = f"G{i}"
+        # Values in this group: i, i+10, i+20, ..., i+990 (100 values each)
+        group_values = [j for j in range(1000) if j % 10 == i]
+
+        assert row["group"] == group_name
+        assert row["value_count"] == 100
+        assert row["value_sum"] == sum(group_values)
+        expected_avg = sum(group_values) / len(group_values)
+        assert abs(row["value_avg"] - expected_avg) < 0.001
+        assert row["other_max"] == max(v * 2 for v in group_values)
