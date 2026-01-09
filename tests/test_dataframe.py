@@ -166,6 +166,363 @@ def test_partial_sql(sp: Session):
     )
 
 
+# ==================== Join Tests ====================
+
+
+def test_join_inner_same_column_name(sp: Session):
+    """Test inner join with same column name in both DataFrames."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2, 3], "val1": ["a", "b", "c"]}))
+    df2 = sp.from_arrow(pa.table({"id": [2, 3, 4], "val2": ["d", "e", "f"]}))
+    result = df1.join(df2, on="id")
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+    assert len(rows) == 2
+    assert rows[0]["id"] == 2
+    assert rows[0]["val1"] == "b"
+    assert rows[0]["val2"] == "d"
+    assert rows[1]["id"] == 3
+    assert rows[1]["val1"] == "c"
+    assert rows[1]["val2"] == "e"
+
+
+def test_join_inner_different_column_names(sp: Session):
+    """Test inner join with different column names using left_on/right_on."""
+    df1 = sp.from_arrow(pa.table({"user_id": [1, 2, 3], "name": ["Alice", "Bob", "Carol"]}))
+    df2 = sp.from_arrow(pa.table({"id": [2, 3, 4], "score": [85, 90, 95]}))
+    result = df1.join(df2, left_on="user_id", right_on="id")
+    rows = sorted(result.take_all(), key=lambda x: x["user_id"])
+    assert len(rows) == 2
+    assert rows[0]["user_id"] == 2
+    assert rows[0]["name"] == "Bob"
+    assert rows[0]["score"] == 85
+    assert rows[1]["user_id"] == 3
+    assert rows[1]["name"] == "Carol"
+    assert rows[1]["score"] == 90
+
+
+def test_join_left(sp: Session):
+    """Test left outer join."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2, 3], "val1": ["a", "b", "c"]}))
+    df2 = sp.from_arrow(pa.table({"id": [2, 3, 4], "val2": ["d", "e", "f"]}))
+    result = df1.join(df2, on="id", how="left")
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+    assert len(rows) == 3
+    # id=1 has no match, val2 should be None
+    assert rows[0]["id"] == 1
+    assert rows[0]["val1"] == "a"
+    assert rows[0]["val2"] is None
+    # id=2 and id=3 have matches
+    assert rows[1]["id"] == 2
+    assert rows[1]["val2"] == "d"
+    assert rows[2]["id"] == 3
+    assert rows[2]["val2"] == "e"
+
+
+def test_join_right(sp: Session):
+    """Test right outer join."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2, 3], "val1": ["a", "b", "c"]}))
+    df2 = sp.from_arrow(pa.table({"id": [2, 3, 4], "val2": ["d", "e", "f"]}))
+    result = df1.join(df2, on="id", how="right")
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+    assert len(rows) == 3
+    # id=2 and id=3 have matches
+    assert rows[0]["id"] == 2
+    assert rows[0]["val1"] == "b"
+    assert rows[0]["val2"] == "d"
+    assert rows[1]["id"] == 3
+    assert rows[1]["val1"] == "c"
+    assert rows[1]["val2"] == "e"
+    # id=4 has no match in left, val1 should be None
+    assert rows[2]["id"] == 4
+    assert rows[2]["val1"] is None
+    assert rows[2]["val2"] == "f"
+
+
+def test_join_outer(sp: Session):
+    """Test full outer join."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2], "val1": ["a", "b"]}))
+    df2 = sp.from_arrow(pa.table({"id": [2, 3], "val2": ["d", "e"]}))
+    result = df1.join(df2, on="id", how="outer")
+    rows = sorted(result.take_all(), key=lambda x: x["id"] if x["id"] is not None else 999)
+    assert len(rows) == 3
+    # id=1: only in left
+    assert rows[0]["id"] == 1
+    assert rows[0]["val1"] == "a"
+    assert rows[0]["val2"] is None
+    # id=2: in both
+    assert rows[1]["id"] == 2
+    assert rows[1]["val1"] == "b"
+    assert rows[1]["val2"] == "d"
+    # id=3: only in right
+    assert rows[2]["id"] == 3
+    assert rows[2]["val1"] is None
+    assert rows[2]["val2"] == "e"
+
+
+def test_join_full(sp: Session):
+    """Test that 'full' is an alias for 'outer'."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2], "val1": ["a", "b"]}))
+    df2 = sp.from_arrow(pa.table({"id": [2, 3], "val2": ["d", "e"]}))
+    result = df1.join(df2, on="id", how="full")
+    rows = result.take_all()
+    assert len(rows) == 3
+
+
+def test_join_cross(sp: Session):
+    """Test cross join (cartesian product)."""
+    df1 = sp.from_arrow(pa.table({"a": [1, 2]}))
+    df2 = sp.from_arrow(pa.table({"b": ["x", "y"]}))
+    result = df1.join(df2, how="cross")
+    rows = result.take_all()
+    assert len(rows) == 4  # 2 x 2 = 4
+    # Check all combinations exist
+    combinations = {(r["a"], r["b"]) for r in rows}
+    assert combinations == {(1, "x"), (1, "y"), (2, "x"), (2, "y")}
+
+
+def test_join_semi(sp: Session):
+    """Test semi join - rows from left that have a match in right."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2, 3], "val": ["a", "b", "c"]}))
+    df2 = sp.from_arrow(pa.table({"id": [2, 3, 4]}))
+    result = df1.join(df2, on="id", how="semi")
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+    assert len(rows) == 2
+    assert rows[0] == {"id": 2, "val": "b"}
+    assert rows[1] == {"id": 3, "val": "c"}
+
+
+def test_join_anti(sp: Session):
+    """Test anti join - rows from left that have no match in right."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2, 3], "val": ["a", "b", "c"]}))
+    df2 = sp.from_arrow(pa.table({"id": [2, 3, 4]}))
+    result = df1.join(df2, on="id", how="anti")
+    rows = result.take_all()
+    assert len(rows) == 1
+    assert rows[0] == {"id": 1, "val": "a"}
+
+
+def test_join_multiple_columns(sp: Session):
+    """Test join on multiple columns."""
+    df1 = sp.from_arrow(pa.table({
+        "id": [1, 1, 2, 2],
+        "date": ["2023-01", "2023-02", "2023-01", "2023-02"],
+        "val1": ["a", "b", "c", "d"]
+    }))
+    df2 = sp.from_arrow(pa.table({
+        "id": [1, 2],
+        "date": ["2023-01", "2023-02"],
+        "val2": ["x", "y"]
+    }))
+    result = df1.join(df2, on=["id", "date"])
+    rows = sorted(result.take_all(), key=lambda x: (x["id"], x["date"]))
+    assert len(rows) == 2
+    assert rows[0]["id"] == 1
+    assert rows[0]["date"] == "2023-01"
+    assert rows[0]["val1"] == "a"
+    assert rows[0]["val2"] == "x"
+    assert rows[1]["id"] == 2
+    assert rows[1]["date"] == "2023-02"
+    assert rows[1]["val1"] == "d"
+    assert rows[1]["val2"] == "y"
+
+
+def test_join_with_npartitions(sp: Session):
+    """Test join with explicit number of partitions and verify exact results."""
+    df1 = sp.from_items(list(range(100))).map("item as id, item * 10 as val1")
+    df2 = sp.from_items(list(range(50, 150))).map("item as id, item * 100 as val2")
+    result = df1.join(df2, on="id", npartitions=5)
+    rows = result.take_all()
+    # Should have 50 matching rows (50-99)
+    assert len(rows) == 50
+    # Verify exact results - each matched row should have correct val1 and val2
+    rows_by_id = {r["id"]: r for r in rows}
+    for id_val in range(50, 100):
+        assert id_val in rows_by_id, f"id={id_val} should be in result"
+        assert rows_by_id[id_val]["val1"] == id_val * 10, f"val1 for id={id_val} should be {id_val * 10}"
+        assert rows_by_id[id_val]["val2"] == id_val * 100, f"val2 for id={id_val} should be {id_val * 100}"
+
+
+def test_join_correctness_across_partitions(sp: Session):
+    """Test that join correctly matches rows across multiple partitions.
+
+    This test verifies that hash partitioning correctly routes matching keys
+    to the same partition and that no data is lost or incorrectly matched.
+    """
+    # Create DataFrames with data that will be distributed across partitions
+    # Use prime numbers to ensure good distribution
+    left_ids = [i * 7 for i in range(1, 51)]  # 7, 14, 21, ..., 350
+    right_ids = [i * 7 for i in range(25, 75)]  # 175, 182, ..., 518
+
+    df1 = sp.from_items(left_ids).map("item as id, item * 2 as left_val")
+    df2 = sp.from_items(right_ids).map("item as id, item * 3 as right_val")
+
+    # Join with multiple partitions to force data distribution
+    result = df1.join(df2, on="id", npartitions=7)
+    rows = result.take_all()
+
+    # Calculate expected matches: intersection of left_ids and right_ids
+    expected_ids = set(left_ids) & set(right_ids)  # 175, 182, ..., 343 (25 values)
+    assert len(rows) == len(expected_ids), f"Expected {len(expected_ids)} rows, got {len(rows)}"
+
+    # Verify each row has correct values
+    rows_by_id = {r["id"]: r for r in rows}
+    for id_val in expected_ids:
+        assert id_val in rows_by_id, f"id={id_val} missing from result"
+        assert rows_by_id[id_val]["left_val"] == id_val * 2, f"left_val wrong for id={id_val}"
+        assert rows_by_id[id_val]["right_val"] == id_val * 3, f"right_val wrong for id={id_val}"
+
+    # Ensure no unexpected ids
+    result_ids = {r["id"] for r in rows}
+    assert result_ids == expected_ids, f"Result ids don't match expected: {result_ids - expected_ids}"
+
+
+def test_join_different_partition_counts(sp: Session):
+    """Test join when DataFrames have different initial partition counts.
+
+    Verifies that joining DataFrames with mismatched partition counts
+    produces correct results after repartitioning.
+    """
+    # Create left DataFrame with more partitions
+    df1 = sp.from_items(list(range(100))).repartition(10, by_rows=True).map("item as id, 'left' as source")
+    # Create right DataFrame with fewer partitions
+    df2 = sp.from_items(list(range(50, 120))).repartition(3, by_rows=True).map("item as id, 'right' as source")
+
+    result = df1.join(df2, on="id")
+    rows = result.take_all()
+
+    # Expected: intersection of [0,99] and [50,119] = [50,99] = 50 rows
+    expected_ids = set(range(50, 100))
+    assert len(rows) == len(expected_ids)
+
+    # Verify all expected ids are present with correct sources
+    result_ids = {r["id"] for r in rows}
+    assert result_ids == expected_ids
+    for row in rows:
+        assert row["source"] == "left", "source column should come from left DataFrame (USING clause)"
+
+
+def test_join_cross_different_partition_counts(sp: Session):
+    """Test cross join with DataFrames of different partition counts.
+
+    Cross join should produce cartesian product regardless of partition counts.
+    """
+    # Left has 3 rows, right has 4 rows
+    df1 = sp.from_items([1, 2, 3]).repartition(5, by_rows=True).map("item as a")
+    df2 = sp.from_items(["w", "x", "y", "z"]).repartition(2, by_rows=True).map("item as b")
+
+    result = df1.join(df2, how="cross")
+    rows = result.take_all()
+
+    # Should have 3 * 4 = 12 combinations
+    assert len(rows) == 12
+
+    # Verify all combinations exist
+    combinations = {(r["a"], r["b"]) for r in rows}
+    expected_combinations = {(a, b) for a in [1, 2, 3] for b in ["w", "x", "y", "z"]}
+    assert combinations == expected_combinations
+
+
+def test_join_left_correctness_with_nulls(sp: Session):
+    """Test left join produces correct NULL values for non-matching rows."""
+    df1 = sp.from_items([1, 2, 3, 4, 5]).map("item as id, item * 10 as val1")
+    df2 = sp.from_items([2, 4]).map("item as id, item * 100 as val2")
+
+    result = df1.join(df2, on="id", how="left", npartitions=3)
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+
+    assert len(rows) == 5
+    # Verify exact values including NULLs
+    expected = [
+        {"id": 1, "val1": 10, "val2": None},
+        {"id": 2, "val1": 20, "val2": 200},
+        {"id": 3, "val1": 30, "val2": None},
+        {"id": 4, "val1": 40, "val2": 400},
+        {"id": 5, "val1": 50, "val2": None},
+    ]
+    for i, row in enumerate(rows):
+        assert row["id"] == expected[i]["id"]
+        assert row["val1"] == expected[i]["val1"]
+        assert row["val2"] == expected[i]["val2"], f"val2 mismatch at id={row['id']}: {row['val2']} != {expected[i]['val2']}"
+
+
+def test_join_multiple_columns_correctness(sp: Session):
+    """Test that multi-column join correctly matches on all columns."""
+    # Create data where single column match would give wrong results
+    df1 = sp.from_arrow(pa.table({
+        "a": [1, 1, 2, 2],
+        "b": [10, 20, 10, 20],
+        "val1": ["a1-b10", "a1-b20", "a2-b10", "a2-b20"]
+    }))
+    df2 = sp.from_arrow(pa.table({
+        "a": [1, 2, 1, 2],
+        "b": [10, 20, 30, 40],
+        "val2": ["r1-10", "r2-20", "r1-30", "r2-40"]
+    }))
+
+    result = df1.join(df2, on=["a", "b"], npartitions=3)
+    rows = sorted(result.take_all(), key=lambda x: (x["a"], x["b"]))
+
+    # Only (1,10) and (2,20) should match
+    assert len(rows) == 2
+    assert rows[0] == {"a": 1, "b": 10, "val1": "a1-b10", "val2": "r1-10"}
+    assert rows[1] == {"a": 2, "b": 20, "val1": "a2-b20", "val2": "r2-20"}
+
+
+def test_join_validation_invalid_type(sp: Session):
+    """Test that invalid join type raises ValueError."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2, 3]}))
+    df2 = sp.from_arrow(pa.table({"id": [1, 2, 3]}))
+    with pytest.raises(ValueError, match="Invalid join type"):
+        df1.join(df2, on="id", how="invalid")
+
+
+def test_join_validation_cross_with_keys(sp: Session):
+    """Test that cross join with join keys raises ValueError."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2]}))
+    df2 = sp.from_arrow(pa.table({"id": [1, 2]}))
+    with pytest.raises(ValueError, match="Cross join does not accept join keys"):
+        df1.join(df2, on="id", how="cross")
+
+
+def test_join_validation_on_with_left_on(sp: Session):
+    """Test that specifying both 'on' and 'left_on' raises ValueError."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2]}))
+    df2 = sp.from_arrow(pa.table({"id": [1, 2]}))
+    with pytest.raises(ValueError, match="Cannot specify both 'on' and 'left_on'"):
+        df1.join(df2, on="id", left_on="id", right_on="id")
+
+
+def test_join_validation_mismatched_columns(sp: Session):
+    """Test that mismatched number of left_on/right_on columns raises ValueError."""
+    df1 = sp.from_arrow(pa.table({"a": [1], "b": [2]}))
+    df2 = sp.from_arrow(pa.table({"c": [1]}))
+    with pytest.raises(ValueError, match="left_on and right_on must have the same number"):
+        df1.join(df2, left_on=["a", "b"], right_on=["c"])
+
+
+def test_join_validation_missing_keys(sp: Session):
+    """Test that non-cross join without keys raises ValueError."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2]}))
+    df2 = sp.from_arrow(pa.table({"id": [1, 2]}))
+    with pytest.raises(ValueError, match="Join keys required"):
+        df1.join(df2, how="inner")
+
+
+def test_join_validation_only_left_on(sp: Session):
+    """Test that specifying only left_on without right_on raises ValueError."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2]}))
+    df2 = sp.from_arrow(pa.table({"id": [1, 2]}))
+    with pytest.raises(ValueError, match="Must specify both 'left_on' and 'right_on'"):
+        df1.join(df2, left_on="id")
+
+
+def test_join_preserves_cache_setting(sp: Session):
+    """Test that join inherits the cache setting."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2]})).no_cache()
+    df2 = sp.from_arrow(pa.table({"id": [1, 2]}))
+    result = df1.join(df2, on="id")
+    assert result._use_cache is False
+
+
 def test_error_message(sp: Session):
     df = sp.from_items([1, 2, 3])
     df = sp.partial_sql("select a,, from {0}", df)

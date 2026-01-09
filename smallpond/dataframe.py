@@ -1003,6 +1003,246 @@ class DataFrame:
         plan = LimitNode(self.session._ctx, self.plan, limit)
         return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache)
 
+    def join(
+        self,
+        other: DataFrame,
+        on: Union[str, List[str], None] = None,
+        left_on: Union[str, List[str], None] = None,
+        right_on: Union[str, List[str], None] = None,
+        how: str = "inner",
+        npartitions: Optional[int] = None,
+        suffix: Tuple[str, str] = ("_left", "_right"),
+    ) -> DataFrame:
+        """
+        Join this DataFrame with another DataFrame.
+
+        This method automatically handles repartitioning both DataFrames by the join keys
+        to ensure correct distributed join execution, and generates the appropriate SQL query.
+
+        Parameters
+        ----------
+        other : DataFrame
+            The right DataFrame to join with.
+        on : str or List[str], optional
+            Column name(s) to join on. Use this when the join columns have the same name
+            in both DataFrames. Cannot be used together with `left_on`/`right_on`.
+        left_on : str or List[str], optional
+            Column name(s) from the left DataFrame (self) to join on.
+            Must be used together with `right_on`.
+        right_on : str or List[str], optional
+            Column name(s) from the right DataFrame (other) to join on.
+            Must be used together with `left_on`.
+        how : str, default 'inner'
+            Type of join to perform. Supported values:
+            - 'inner': Inner join - only rows with matching keys in both DataFrames.
+            - 'left': Left outer join - all rows from left DataFrame, matching rows from right.
+            - 'right': Right outer join - all rows from right DataFrame, matching rows from left.
+            - 'outer' or 'full': Full outer join - all rows from both DataFrames.
+            - 'cross': Cross join - cartesian product of both DataFrames (no join keys needed).
+            - 'semi': Semi join - rows from left DataFrame that have a match in right DataFrame.
+            - 'anti': Anti join - rows from left DataFrame that have no match in right DataFrame.
+        npartitions : int, optional
+            Number of partitions to use for the join. If not specified, uses the maximum
+            number of partitions from both DataFrames. This ensures that the larger DataFrame
+            maintains its parallelism level, while the smaller DataFrame is repartitioned to
+            match. Although this may create some empty or sparse partitions when DataFrames
+            have very different sizes, it preserves the parallelism of the larger DataFrame
+            and avoids the overhead of determining optimal partition counts dynamically.
+        suffix : Tuple[str, str], default ('_left', '_right')
+            Reserved for future use. Currently, when using the `on` parameter (same column
+            names in both DataFrames), DuckDB's USING clause automatically deduplicates the
+            join columns. When using `left_on`/`right_on` (different column names), all
+            columns from both DataFrames are included in the result. If you need to handle
+            overlapping non-join column names, use `map()` to rename columns before joining.
+
+        Returns
+        -------
+        DataFrame
+            A new DataFrame containing the joined data.
+
+        Raises
+        ------
+        ValueError
+            If join parameters are invalid (e.g., using both `on` and `left_on`/`right_on`,
+            or specifying mismatched number of columns in `left_on` and `right_on`).
+
+        Examples
+        --------
+        Inner join on a single column with the same name:
+
+        .. code-block::
+
+            result = df1.join(df2, on="id")
+
+        Inner join on multiple columns:
+
+        .. code-block::
+
+            result = df1.join(df2, on=["id", "date"])
+
+        Left join with different column names:
+
+        .. code-block::
+
+            result = df1.join(df2, left_on="user_id", right_on="id", how="left")
+
+        Full outer join:
+
+        .. code-block::
+
+            result = df1.join(df2, on="id", how="outer")
+
+        Cross join (cartesian product):
+
+        .. code-block::
+
+            result = df1.join(df2, how="cross")
+
+        Notes
+        -----
+        - Both DataFrames are automatically repartitioned by the join keys using hash
+          partitioning to ensure that matching rows end up in the same partition.
+        - For cross joins, no repartitioning is performed since all combinations are needed.
+        - The join is executed partition-by-partition using DuckDB SQL.
+        """
+        # Validate join type
+        valid_join_types = {"inner", "left", "right", "outer", "full", "cross", "semi", "anti"}
+        how_lower = how.lower()
+        if how_lower not in valid_join_types:
+            raise ValueError(
+                f"Invalid join type '{how}'. Supported types are: {', '.join(sorted(valid_join_types))}"
+            )
+
+        # Normalize 'full' to 'outer' for SQL generation
+        if how_lower == "full":
+            how_lower = "outer"
+
+        # Validate join key parameters
+        if how_lower == "cross":
+            # Cross join doesn't need join keys
+            if on is not None or left_on is not None or right_on is not None:
+                raise ValueError("Cross join does not accept join keys (on, left_on, right_on)")
+            left_cols: List[str] = []
+            right_cols: List[str] = []
+        else:
+            # Non-cross joins require join keys
+            if on is not None:
+                if left_on is not None or right_on is not None:
+                    raise ValueError("Cannot specify both 'on' and 'left_on'/'right_on'")
+                left_cols = [on] if isinstance(on, str) else list(on)
+                right_cols = left_cols.copy()
+            elif left_on is not None and right_on is not None:
+                left_cols = [left_on] if isinstance(left_on, str) else list(left_on)
+                right_cols = [right_on] if isinstance(right_on, str) else list(right_on)
+                if len(left_cols) != len(right_cols):
+                    raise ValueError(
+                        f"left_on and right_on must have the same number of columns. "
+                        f"Got {len(left_cols)} left columns and {len(right_cols)} right columns."
+                    )
+            elif left_on is not None or right_on is not None:
+                raise ValueError("Must specify both 'left_on' and 'right_on', or use 'on' for same-named columns")
+            else:
+                raise ValueError(
+                    f"Join keys required for '{how}' join. Use 'on' for same-named columns, "
+                    "or 'left_on' and 'right_on' for different column names."
+                )
+
+        # Determine number of partitions.
+        # We use the maximum partition count from both DataFrames to preserve parallelism
+        # of the larger DataFrame. While this may result in some sparse partitions when
+        # joining DataFrames of very different sizes, it avoids the complexity of dynamically
+        # determining optimal partition counts based on data size, which would require
+        # computing metadata before the join. Users can override this by specifying npartitions.
+        if npartitions is None:
+            npartitions = max(self.plan.num_partitions, other.plan.num_partitions)
+
+        # Repartition both DataFrames by join keys (skip for cross join)
+        if how_lower == "cross":
+            left_df = self
+            right_df = other
+        else:
+            left_df = self.repartition(npartitions, hash_by=left_cols)
+            right_df = other.repartition(npartitions, hash_by=right_cols)
+
+        # Build the SQL query
+        sql = self._build_join_sql(how_lower, left_cols, right_cols, suffix)
+
+        # Execute the join using partial_sql
+        plan = SqlEngineNode(
+            self.session._ctx,
+            (left_df.plan, right_df.plan),
+            sql,
+        )
+        recompute = self.need_recompute or other.need_recompute
+        return DataFrame(self.session, plan, recompute=recompute, use_cache=self._use_cache)
+
+    def _build_join_sql(
+        self,
+        how: str,
+        left_cols: List[str],
+        right_cols: List[str],
+        suffix: Tuple[str, str],
+    ) -> str:
+        """
+        Build the SQL query for the join operation.
+
+        Parameters
+        ----------
+        how : str
+            The join type (inner, left, right, outer, cross, semi, anti).
+        left_cols : List[str]
+            Column names from the left DataFrame to join on.
+        right_cols : List[str]
+            Column names from the right DataFrame to join on.
+        suffix : Tuple[str, str]
+            Suffixes for overlapping column names (reserved for future use).
+
+        Returns
+        -------
+        str
+            The SQL query string.
+        """
+        # Map join type to SQL syntax
+        join_type_map = {
+            "inner": "INNER JOIN",
+            "left": "LEFT OUTER JOIN",
+            "right": "RIGHT OUTER JOIN",
+            "outer": "FULL OUTER JOIN",
+            "cross": "CROSS JOIN",
+            "semi": "SEMI JOIN",
+            "anti": "ANTI JOIN",
+        }
+        join_clause = join_type_map[how]
+
+        # Build the ON clause for non-cross joins
+        if how == "cross":
+            on_clause = ""
+        else:
+            conditions = []
+            for left_col, right_col in zip(left_cols, right_cols):
+                # Quote column names to handle special characters and reserved words
+                left_quoted = f'"{left_col}"'
+                right_quoted = f'"{right_col}"'
+                conditions.append(f"__left__.{left_quoted} = __right__.{right_quoted}")
+            on_clause = f" ON {' AND '.join(conditions)}"
+
+        # For semi and anti joins, only select from left table
+        if how in ("semi", "anti"):
+            return f"SELECT __left__.* FROM {{0}} AS __left__ {join_clause} {{1}} AS __right__{on_clause}"
+
+        if left_cols == right_cols:
+            # Same column names in both DataFrames - use DuckDB's USING clause.
+            # USING automatically deduplicates the join columns (includes them once in the result)
+            # and is cleaner than manually excluding columns with complex SQL.
+            using_cols = ", ".join(f'"{col}"' for col in left_cols)
+            return f"SELECT * FROM {{0}} AS __left__ {join_clause} {{1}} AS __right__ USING ({using_cols})"
+        else:
+            # Different column names - select all columns from both tables.
+            # Both join key columns will be included in the result (e.g., user_id and id).
+            # If there are overlapping non-join column names, users should rename them
+            # before joining using map() to avoid ambiguity.
+            return f"SELECT __left__.*, __right__.* FROM {{0}} AS __left__ {join_clause} {{1}} AS __right__{on_clause}"
+
     def sample(
         self,
         n: Optional[int] = None,
