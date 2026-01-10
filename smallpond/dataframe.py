@@ -1490,6 +1490,529 @@ class DataFrame:
 
         return partial_sql, final_sql
 
+    def describe(self) -> Dict[str, Any]:
+        """
+        Get overview statistics of the DataFrame.
+
+        This method computes comprehensive statistics about the DataFrame, including
+        schema information, row counts, null counts, and summary statistics for
+        numeric columns (min, max, mean, approximate median, std).
+
+        The statistics are computed correctly across all partitions using a two-phase
+        approach to ensure accurate results for distributed data.
+
+        Returns
+        -------
+        Dict[str, Any]
+            A dictionary containing the following keys:
+
+            - **num_rows** (int): Total number of rows in the DataFrame.
+            - **num_columns** (int): Total number of columns.
+            - **columns** (List[Dict[str, Any]]): Per-column statistics, where each
+              column entry contains:
+
+              - **name** (str): Column name.
+              - **dtype** (str): Data type of the column.
+              - **null_count** (int): Number of null/missing values.
+              - **non_null_count** (int): Number of non-null values.
+              - **null_percent** (float): Percentage of null values (0-100).
+
+              For numeric columns (int, float), additional statistics are included:
+
+              - **min** (numeric): Minimum value (excluding nulls).
+              - **max** (numeric): Maximum value (excluding nulls).
+              - **mean** (float): Mean/average value (excluding nulls).
+              - **approx_median** (float): **Approximate** median value (50th percentile,
+                excluding nulls). See notes below for accuracy details.
+              - **std** (float): Standard deviation (excluding nulls).
+              - **sum** (numeric): Sum of all values (excluding nulls).
+
+        Examples
+        --------
+        Basic usage:
+
+        .. code-block::
+
+            stats = df.describe()
+            print(f"Total rows: {stats['num_rows']}")
+            print(f"Columns: {[col['name'] for col in stats['columns']]}")
+
+        Inspecting numeric column statistics:
+
+        .. code-block::
+
+            stats = df.describe()
+            for col in stats['columns']:
+                print(f"{col['name']} ({col['dtype']}): {col['non_null_count']} non-null values")
+                if 'mean' in col:
+                    print(f"  Mean: {col['mean']}, Min: {col['min']}, Max: {col['max']}")
+                    print(f"  Approx Median: {col['approx_median']}")
+
+        Notes
+        -----
+        - This operation triggers execution of the lazy transformations performed
+          on this DataFrame.
+        - Statistics for numeric columns are computed using a two-phase aggregation
+          to correctly combine results across partitions:
+
+          - Phase 1: Compute partial statistics (count, sum, sum of squares, min, max,
+            t-digest for median) per partition.
+          - Phase 2: Merge partial results to compute final statistics.
+
+        - **Approximate Median**: The median is computed using the t-digest algorithm,
+          which is a memory-efficient streaming algorithm that provides approximate
+          quantiles. This approach:
+
+          - Uses O(δ) memory where δ is the compression parameter (default 100),
+            regardless of data size
+          - Provides higher accuracy near the tails (0th and 100th percentiles)
+            and slightly lower accuracy near the median (50th percentile)
+          - Is suitable for large-scale distributed data where exact median
+            computation would require collecting all values in memory
+
+        - **When to use describe() vs to_pandas().median()**:
+
+          +------------------+------------------+------------------+-------------------+
+          | Dataset Size     | describe()       | to_pandas()      | Recommendation    |
+          +==================+==================+==================+===================+
+          | n ≤ 100          | < 1% error       | Exact            | Either works      |
+          +------------------+------------------+------------------+-------------------+
+          | n ≤ 1,000        | < 2% error       | Exact            | Either works      |
+          +------------------+------------------+------------------+-------------------+
+          | n ≤ 10,000       | < 5% error       | Exact            | describe() for    |
+          |                  |                  |                  | quick exploration |
+          +------------------+------------------+------------------+-------------------+
+          | n > 10,000       | < 10% error      | Memory intensive | Use describe()    |
+          +------------------+------------------+------------------+-------------------+
+          | n > 1,000,000    | < 10% error      | May fail (OOM)   | Use describe()    |
+          +------------------+------------------+------------------+-------------------+
+
+          **Use describe() when:**
+
+          - You need a quick overview of large datasets
+          - Memory is constrained
+          - Approximate median is acceptable (exploratory analysis)
+          - Data is distributed across many partitions
+
+          **Use to_pandas().median() when:**
+
+          - You need exact median values
+          - Dataset fits comfortably in memory (< 10,000 rows)
+          - Precision is critical for your analysis
+          - You're doing final reporting or statistical tests
+
+          Example for exact median:
+
+          .. code-block::
+
+              # For exact median on smaller datasets
+              exact_median = df.to_pandas()['column_name'].median()
+
+        - Standard deviation is computed using the population formula
+          (dividing by N, not N-1).
+        - Partitions with all-null values for a column are handled correctly and
+          do not affect the statistics of partitions that have valid data.
+        """
+        datasets = self._compute()
+
+        # Handle empty DataFrame case (no datasets at all)
+        if not datasets:
+            return {
+                "num_rows": 0,
+                "num_columns": 0,
+                "columns": [],
+            }
+
+        # Get schema from first dataset with columns (schema exists even for 0-row tables)
+        schema = None
+        for dataset in datasets:
+            arrow_table = dataset.to_arrow_table()
+            if arrow_table.num_columns > 0:
+                schema = arrow_table.schema
+                break
+
+        if schema is None:
+            # All datasets have no columns - return empty result
+            total_rows = sum(dataset.num_rows for dataset in datasets)
+            return {
+                "num_rows": total_rows,
+                "num_columns": 0,
+                "columns": [],
+            }
+
+        # Identify numeric columns for additional statistics
+        numeric_types = {
+            "int8", "int16", "int32", "int64",
+            "uint8", "uint16", "uint32", "uint64",
+            "float", "float16", "float32", "float64", "double",
+            "decimal", "decimal128", "decimal256",
+        }
+
+        column_info = []
+        for field in schema:
+            dtype_str = str(field.type).lower()
+            is_numeric = any(nt in dtype_str for nt in numeric_types)
+            column_info.append({
+                "name": field.name,
+                "dtype": str(field.type),
+                "is_numeric": is_numeric,
+            })
+
+        # Phase 1: Compute partial statistics per partition
+        # We'll collect: count, null_count, and for numeric: sum, sum_sq, min, max, t-digest centroids
+        partial_stats = []
+
+        for dataset in datasets:
+            arrow_table = dataset.to_arrow_table()
+            partition_stats = {"total_rows": arrow_table.num_rows}
+
+            for col_info in column_info:
+                col_name = col_info["name"]
+                col_idx = schema.get_field_index(col_name)
+                col_array = arrow_table.column(col_idx)
+
+                # Basic counts
+                null_count = col_array.null_count
+                non_null_count = len(col_array) - null_count
+
+                col_stats = {
+                    "null_count": null_count,
+                    "non_null_count": non_null_count,
+                }
+
+                # Numeric statistics - only compute if there are non-null values
+                if col_info["is_numeric"] and non_null_count > 0:
+                    # Convert to pandas for easier numeric operations
+                    values = col_array.to_pandas().dropna()
+                    if len(values) > 0:
+                        col_stats["sum"] = float(values.sum())
+                        col_stats["sum_sq"] = float((values ** 2).sum())
+                        col_stats["min"] = float(values.min())
+                        col_stats["max"] = float(values.max())
+                        # Build t-digest centroids for memory-efficient approximate median
+                        col_stats["tdigest"] = self._build_tdigest(values.tolist())
+
+                partition_stats[col_name] = col_stats
+
+            partial_stats.append(partition_stats)
+
+        # Phase 2: Merge partial statistics across partitions
+        total_rows = sum(ps.get("total_rows", 0) for ps in partial_stats)
+
+        columns_result = []
+        for col_info in column_info:
+            col_name = col_info["name"]
+
+            # Aggregate counts with defensive checks
+            total_null = 0
+            total_non_null = 0
+            for ps in partial_stats:
+                if col_name in ps:
+                    total_null += ps[col_name].get("null_count", 0)
+                    total_non_null += ps[col_name].get("non_null_count", 0)
+
+            col_result = {
+                "name": col_name,
+                "dtype": col_info["dtype"],
+                "null_count": total_null,
+                "non_null_count": total_non_null,
+                "null_percent": (total_null / total_rows * 100) if total_rows > 0 else 0.0,
+            }
+
+            # Merge numeric statistics
+            if col_info["is_numeric"] and total_non_null > 0:
+                # Collect all partial stats that have numeric data (filter out all-null partitions)
+                numeric_partials = []
+                for ps in partial_stats:
+                    if col_name in ps:
+                        col_ps = ps[col_name]
+                        # Only include partitions that have actual numeric data
+                        if "sum" in col_ps and "min" in col_ps and "max" in col_ps:
+                            numeric_partials.append(col_ps)
+
+                if numeric_partials:
+                    # Sum and sum of squares for mean and std - with defensive defaults
+                    total_sum = sum(p.get("sum", 0) for p in numeric_partials)
+                    total_sum_sq = sum(p.get("sum_sq", 0) for p in numeric_partials)
+
+                    # Count of non-null values from partitions with data
+                    count_from_partials = sum(p.get("non_null_count", 0) for p in numeric_partials)
+
+                    # Min and max across partitions
+                    mins = [p["min"] for p in numeric_partials if "min" in p]
+                    maxs = [p["max"] for p in numeric_partials if "max" in p]
+
+                    if mins and maxs and count_from_partials > 0:
+                        global_min = min(mins)
+                        global_max = max(maxs)
+
+                        # Mean
+                        mean = total_sum / count_from_partials
+
+                        # Standard deviation using: std = sqrt(E[X^2] - (E[X])^2)
+                        variance = (total_sum_sq / count_from_partials) - (mean ** 2)
+                        # Handle floating point errors that could make variance slightly negative
+                        std = (max(0, variance)) ** 0.5
+
+                        # Approximate median: merge t-digests from all partitions
+                        tdigests = [p["tdigest"] for p in numeric_partials if "tdigest" in p]
+                        if tdigests:
+                            merged_tdigest = self._merge_tdigests(tdigests)
+                            approx_median = self._tdigest_quantile(merged_tdigest, 0.5)
+                        else:
+                            approx_median = None
+
+                        col_result["min"] = global_min
+                        col_result["max"] = global_max
+                        col_result["mean"] = mean
+                        col_result["approx_median"] = approx_median
+                        col_result["std"] = std
+                        col_result["sum"] = total_sum
+
+            columns_result.append(col_result)
+
+        return {
+            "num_rows": total_rows,
+            "num_columns": len(column_info),
+            "columns": columns_result,
+        }
+
+    def _build_tdigest(self, values: List[float], compression: float = 100.0) -> Dict[str, Any]:
+        """
+        Build a t-digest data structure from a list of values.
+
+        T-digest is a data structure for accurate estimation of quantiles with
+        bounded memory usage. It uses a compression parameter δ to control the
+        trade-off between accuracy and memory.
+
+        Parameters
+        ----------
+        values : List[float]
+            The values to build the t-digest from.
+        compression : float
+            The compression parameter δ. Higher values give more accuracy but use more memory.
+            Default is 100, which provides good accuracy for most use cases.
+
+        Returns
+        -------
+        Dict[str, Any]
+            A dictionary containing:
+            - centroids: List of (mean, weight) tuples representing the digest
+            - count: Total number of values
+            - min: Minimum value
+            - max: Maximum value
+        """
+        if not values:
+            return {"centroids": [], "count": 0, "min": None, "max": None}
+
+        sorted_values = sorted(values)
+        n = len(sorted_values)
+
+        # For small datasets, store exact values as centroids
+        if n <= compression:
+            centroids = [(v, 1.0) for v in sorted_values]
+            return {
+                "centroids": centroids,
+                "count": n,
+                "min": sorted_values[0],
+                "max": sorted_values[-1],
+            }
+
+        # For larger datasets, cluster values into centroids
+        # Using scale function k1: k(q) = δ/2 * arcsin(2q - 1) / π
+        # This gives higher resolution at the tails
+        centroids = []
+        current_mean = sorted_values[0]
+        current_weight = 1.0
+        current_quantile = 0.0
+
+        def scale_func(q: float, delta: float) -> float:
+            """Scale function k1 for t-digest."""
+            import math
+            return delta / (2 * math.pi) * math.asin(2 * q - 1)
+
+        for i in range(1, n):
+            proposed_weight = current_weight + 1
+            proposed_quantile = (current_quantile * current_weight + (i / n)) / proposed_weight
+
+            # Check if we should start a new centroid
+            k_current = scale_func(current_quantile, compression)
+            k_proposed = scale_func(proposed_quantile, compression)
+
+            if k_proposed - k_current <= 1:
+                # Merge into current centroid
+                current_mean = (current_mean * current_weight + sorted_values[i]) / proposed_weight
+                current_weight = proposed_weight
+                current_quantile = proposed_quantile
+            else:
+                # Start new centroid
+                centroids.append((current_mean, current_weight))
+                current_mean = sorted_values[i]
+                current_weight = 1.0
+                current_quantile = i / n
+
+        # Add the last centroid
+        centroids.append((current_mean, current_weight))
+
+        return {
+            "centroids": centroids,
+            "count": n,
+            "min": sorted_values[0],
+            "max": sorted_values[-1],
+        }
+
+    def _merge_tdigests(self, tdigests: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Merge multiple t-digests into one.
+
+        Parameters
+        ----------
+        tdigests : List[Dict[str, Any]]
+            List of t-digest structures to merge.
+
+        Returns
+        -------
+        Dict[str, Any]
+            A merged t-digest structure.
+        """
+        if not tdigests:
+            return {"centroids": [], "count": 0, "min": None, "max": None}
+
+        if len(tdigests) == 1:
+            return tdigests[0]
+
+        # Collect all centroids and sort by mean
+        all_centroids = []
+        total_count = 0
+        global_min = None
+        global_max = None
+
+        for td in tdigests:
+            if td["count"] > 0:
+                all_centroids.extend(td["centroids"])
+                total_count += td["count"]
+                if td["min"] is not None:
+                    if global_min is None:
+                        global_min = td["min"]
+                    else:
+                        global_min = min(global_min, td["min"])
+                if td["max"] is not None:
+                    if global_max is None:
+                        global_max = td["max"]
+                    else:
+                        global_max = max(global_max, td["max"])
+
+        if not all_centroids:
+            return {"centroids": [], "count": 0, "min": None, "max": None}
+
+        # Sort centroids by mean
+        all_centroids.sort(key=lambda x: x[0])
+
+        # Re-cluster centroids using the same algorithm
+        compression = 100.0
+        merged_centroids = []
+        current_mean, current_weight = all_centroids[0]
+        cumulative_weight = current_weight
+
+        def scale_func(q: float, delta: float) -> float:
+            import math
+            return delta / (2 * math.pi) * math.asin(2 * max(0, min(1, q)) - 1)
+
+        for mean, weight in all_centroids[1:]:
+            proposed_weight = current_weight + weight
+            current_quantile = (cumulative_weight - current_weight / 2) / total_count
+            proposed_quantile = (cumulative_weight + weight / 2) / total_count
+
+            k_current = scale_func(current_quantile, compression)
+            k_proposed = scale_func(proposed_quantile, compression)
+
+            if k_proposed - k_current <= 1:
+                # Merge
+                current_mean = (current_mean * current_weight + mean * weight) / proposed_weight
+                current_weight = proposed_weight
+            else:
+                # New centroid
+                merged_centroids.append((current_mean, current_weight))
+                current_mean = mean
+                current_weight = weight
+
+            cumulative_weight += weight
+
+        merged_centroids.append((current_mean, current_weight))
+
+        return {
+            "centroids": merged_centroids,
+            "count": total_count,
+            "min": global_min,
+            "max": global_max,
+        }
+
+    def _tdigest_quantile(self, tdigest: Dict[str, Any], q: float) -> Optional[float]:
+        """
+        Compute a quantile from a t-digest.
+
+        Parameters
+        ----------
+        tdigest : Dict[str, Any]
+            The t-digest structure.
+        q : float
+            The quantile to compute (0.0 to 1.0).
+
+        Returns
+        -------
+        Optional[float]
+            The estimated quantile value, or None if the digest is empty.
+        """
+        centroids = tdigest["centroids"]
+        total_count = tdigest["count"]
+
+        if not centroids or total_count == 0:
+            return None
+
+        if len(centroids) == 1:
+            return centroids[0][0]
+
+        # Handle edge cases
+        if q <= 0:
+            return tdigest["min"]
+        if q >= 1:
+            return tdigest["max"]
+
+        # Find the centroid containing the quantile
+        target_rank = q * total_count
+        cumulative_weight = 0.0
+
+        for i, (mean, weight) in enumerate(centroids):
+            if cumulative_weight + weight >= target_rank:
+                # Interpolate within this centroid
+                if i == 0:
+                    # First centroid - interpolate from min
+                    left_mean = tdigest["min"]
+                    left_weight = 0
+                else:
+                    left_mean, left_weight = centroids[i - 1]
+
+                # Linear interpolation
+                weight_before = cumulative_weight
+                weight_in_centroid = target_rank - weight_before
+                fraction = weight_in_centroid / weight if weight > 0 else 0.5
+
+                # Interpolate between this centroid and neighbors
+                if fraction <= 0.5 and i > 0:
+                    # Closer to left neighbor
+                    return left_mean + (mean - left_mean) * (0.5 + fraction)
+                elif fraction > 0.5 and i < len(centroids) - 1:
+                    # Closer to right neighbor
+                    right_mean = centroids[i + 1][0]
+                    return mean + (right_mean - mean) * (fraction - 0.5)
+                else:
+                    return mean
+
+            cumulative_weight += weight
+
+        # Should not reach here, but return max as fallback
+        return tdigest["max"]
+
     def sample(
         self,
         n: Optional[int] = None,

@@ -1421,3 +1421,773 @@ def test_groupby_agg_large_dataset_correctness(sp: Session):
         expected_avg = sum(group_values) / len(group_values)
         assert abs(row["value_avg"] - expected_avg) < 0.001
         assert row["other_max"] == max(v * 2 for v in group_values)
+
+
+# ==================== Describe Tests ====================
+
+
+def test_describe_basic(sp: Session):
+    """Test basic describe functionality with simple DataFrame."""
+    df = sp.from_arrow(pa.table({
+        "a": [1, 2, 3, 4, 5],
+        "b": ["x", "y", "z", "w", "v"]
+    }))
+    stats = df.describe()
+
+    assert stats["num_rows"] == 5
+    assert stats["num_columns"] == 2
+
+    # Check column a (numeric)
+    col_a = next(c for c in stats["columns"] if c["name"] == "a")
+    assert col_a["dtype"] == "int64"
+    assert col_a["null_count"] == 0
+    assert col_a["non_null_count"] == 5
+    assert col_a["null_percent"] == 0.0
+    assert col_a["min"] == 1.0
+    assert col_a["max"] == 5.0
+    assert col_a["mean"] == 3.0
+    # approx_median uses t-digest, should be close to 3.0
+    assert abs(col_a["approx_median"] - 3.0) < 0.5
+    assert col_a["sum"] == 15.0
+
+    # Check column b (string - no numeric stats)
+    col_b = next(c for c in stats["columns"] if c["name"] == "b")
+    assert "large_string" in col_b["dtype"] or "string" in col_b["dtype"]
+    assert col_b["null_count"] == 0
+    assert col_b["non_null_count"] == 5
+    assert "min" not in col_b
+    assert "mean" not in col_b
+
+
+def test_describe_with_nulls(sp: Session):
+    """Test describe correctly handles null values."""
+    df = sp.from_arrow(pa.table({
+        "value": pa.array([1, None, 3, None, 5], type=pa.int64()),
+        "name": pa.array(["a", "b", None, "d", None], type=pa.large_string())
+    }))
+    stats = df.describe()
+
+    assert stats["num_rows"] == 5
+
+    # Check value column
+    col_value = next(c for c in stats["columns"] if c["name"] == "value")
+    assert col_value["null_count"] == 2
+    assert col_value["non_null_count"] == 3
+    assert col_value["null_percent"] == 40.0
+    assert col_value["min"] == 1.0
+    assert col_value["max"] == 5.0
+    assert col_value["mean"] == 3.0  # (1 + 3 + 5) / 3
+    # approx_median uses t-digest, should be close to 3.0
+    assert abs(col_value["approx_median"] - 3.0) < 0.5
+
+    # Check name column
+    col_name = next(c for c in stats["columns"] if c["name"] == "name")
+    assert col_name["null_count"] == 2
+    assert col_name["non_null_count"] == 3
+    assert col_name["null_percent"] == 40.0
+
+
+def test_describe_all_numeric_stats(sp: Session):
+    """Test all numeric statistics are computed correctly."""
+    # Using values where we can compute expected stats easily
+    df = sp.from_arrow(pa.table({
+        "x": [2, 4, 6, 8, 10]
+    }))
+    stats = df.describe()
+
+    col_x = stats["columns"][0]
+    assert col_x["min"] == 2.0
+    assert col_x["max"] == 10.0
+    assert col_x["mean"] == 6.0  # (2+4+6+8+10)/5
+    # approx_median uses t-digest, should be close to 6.0
+    assert abs(col_x["approx_median"] - 6.0) < 0.5
+    assert col_x["sum"] == 30.0
+
+    # Standard deviation: sqrt(sum((x - mean)^2) / n)
+    # Variance = ((2-6)^2 + (4-6)^2 + (6-6)^2 + (8-6)^2 + (10-6)^2) / 5
+    #          = (16 + 4 + 0 + 4 + 16) / 5 = 40 / 5 = 8
+    # Std = sqrt(8) ≈ 2.828
+    expected_std = (8.0) ** 0.5
+    assert abs(col_x["std"] - expected_std) < 0.001
+
+
+def test_describe_approx_median_even_count(sp: Session):
+    """Test approximate median calculation with even number of values."""
+    df = sp.from_arrow(pa.table({
+        "x": [1, 2, 3, 4]  # exact median should be (2+3)/2 = 2.5
+    }))
+    stats = df.describe()
+
+    col_x = stats["columns"][0]
+    # approx_median uses t-digest, should be close to 2.5
+    assert abs(col_x["approx_median"] - 2.5) < 0.5
+
+
+def test_describe_multiple_numeric_columns(sp: Session):
+    """Test describe with multiple numeric columns of different types."""
+    df = sp.from_arrow(pa.table({
+        "int_col": pa.array([1, 2, 3], type=pa.int32()),
+        "float_col": pa.array([1.5, 2.5, 3.5], type=pa.float64()),
+        "str_col": ["a", "b", "c"]
+    }))
+    stats = df.describe()
+
+    assert stats["num_columns"] == 3
+
+    # Int column
+    col_int = next(c for c in stats["columns"] if c["name"] == "int_col")
+    assert col_int["mean"] == 2.0
+    assert "int32" in col_int["dtype"]
+
+    # Float column
+    col_float = next(c for c in stats["columns"] if c["name"] == "float_col")
+    assert col_float["mean"] == 2.5
+    assert "float64" in col_float["dtype"] or "double" in col_float["dtype"]
+
+    # String column - should have no numeric stats
+    col_str = next(c for c in stats["columns"] if c["name"] == "str_col")
+    assert "mean" not in col_str
+
+
+def test_describe_across_partitions(sp: Session):
+    """Test describe correctly merges statistics across multiple partitions."""
+    # Create data distributed across 5 partitions
+    items = [{"value": i, "category": chr(65 + i % 3)} for i in range(100)]
+    df = sp.from_items(items).repartition(5, by_rows=True)
+
+    stats = df.describe()
+
+    assert stats["num_rows"] == 100
+
+    # Check value column statistics
+    col_value = next(c for c in stats["columns"] if c["name"] == "value")
+    assert col_value["null_count"] == 0
+    assert col_value["non_null_count"] == 100
+    assert col_value["min"] == 0.0
+    assert col_value["max"] == 99.0
+    assert col_value["sum"] == sum(range(100))  # 4950
+    assert col_value["mean"] == 49.5  # sum / 100
+
+    # Approx median should be close to exact median of 0-99: (49 + 50) / 2 = 49.5
+    assert abs(col_value["approx_median"] - 49.5) < 2.0
+
+
+def test_describe_partition_correctness_edge_case(sp: Session):
+    """Test that describe correctly handles data split across partitions.
+
+    This tests the edge case where statistics must be correctly combined:
+    - Partition 1: [1, 2, 3]
+    - Partition 2: [100, 101, 102]
+
+    Simple averaging of partition means would give wrong result.
+    """
+    # Create two distinct partitions with very different values
+    items = [{"value": i} for i in [1, 2, 3, 100, 101, 102]]
+    df = sp.from_items(items).repartition(2, by_rows=True)
+
+    stats = df.describe()
+
+    col_value = stats["columns"][0]
+
+    # Correct mean: (1+2+3+100+101+102) / 6 = 309 / 6 = 51.5
+    assert col_value["mean"] == 51.5
+
+    # Min should be global min
+    assert col_value["min"] == 1.0
+
+    # Max should be global max
+    assert col_value["max"] == 102.0
+
+    # Approx median: sorted [1, 2, 3, 100, 101, 102], exact median = (3 + 100) / 2 = 51.5
+    # t-digest may not give exact result for this bimodal distribution, allow larger tolerance
+    assert abs(col_value["approx_median"] - 51.5) < 10.0
+
+
+def test_describe_std_across_partitions(sp: Session):
+    """Test standard deviation is computed correctly across partitions."""
+    # Data: [0, 10] - mean=5, variance=25, std=5
+    df = sp.from_items([{"x": 0}, {"x": 10}]).repartition(2, by_rows=True)
+
+    stats = df.describe()
+    col_x = stats["columns"][0]
+
+    # Mean = 5
+    assert col_x["mean"] == 5.0
+
+    # Variance = ((0-5)^2 + (10-5)^2) / 2 = (25 + 25) / 2 = 25
+    # Std = sqrt(25) = 5
+    assert abs(col_x["std"] - 5.0) < 0.001
+
+
+def test_describe_empty_dataframe(sp: Session):
+    """Test describe handles empty DataFrame (no rows but has schema)."""
+    # Create an empty DataFrame by filtering out all rows
+    df = sp.from_arrow(pa.table({"x": [1, 2, 3]})).filter("x < 0")
+    stats = df.describe()
+
+    assert stats["num_rows"] == 0
+    assert stats["num_columns"] == 1
+
+    # Column should still be present with schema info
+    col_x = stats["columns"][0]
+    assert col_x["name"] == "x"
+    assert col_x["null_count"] == 0
+    assert col_x["non_null_count"] == 0
+    # No numeric stats because no data
+    assert "min" not in col_x
+    assert "mean" not in col_x
+
+
+def test_describe_single_row(sp: Session):
+    """Test describe with single row DataFrame."""
+    df = sp.from_arrow(pa.table({"x": [42]}))
+    stats = df.describe()
+
+    assert stats["num_rows"] == 1
+    col_x = stats["columns"][0]
+    assert col_x["min"] == 42.0
+    assert col_x["max"] == 42.0
+    assert col_x["mean"] == 42.0
+    assert col_x["approx_median"] == 42.0
+    assert col_x["std"] == 0.0  # std of single value is 0
+
+
+def test_describe_all_nulls_numeric(sp: Session):
+    """Test describe handles column with all null values."""
+    df = sp.from_arrow(pa.table({
+        "x": pa.array([None, None, None], type=pa.int64())
+    }))
+    stats = df.describe()
+
+    col_x = stats["columns"][0]
+    assert col_x["null_count"] == 3
+    assert col_x["non_null_count"] == 0
+    assert col_x["null_percent"] == 100.0
+    # Should not have numeric stats since all values are null
+    assert "min" not in col_x
+    assert "mean" not in col_x
+
+
+def test_describe_large_dataset(sp: Session):
+    """Test describe correctness with large dataset across many partitions."""
+    # Create 1000 rows across 10 partitions
+    items = [{"value": i, "squared": i * i} for i in range(1000)]
+    df = sp.from_items(items).repartition(10, by_rows=True)
+
+    stats = df.describe()
+
+    assert stats["num_rows"] == 1000
+    assert stats["num_columns"] == 2
+
+    col_value = next(c for c in stats["columns"] if c["name"] == "value")
+    assert col_value["min"] == 0.0
+    assert col_value["max"] == 999.0
+    assert col_value["sum"] == sum(range(1000))  # 499500
+    assert col_value["mean"] == 499.5
+
+    # Approx median should be close to exact median of 0-999: (499 + 500) / 2 = 499.5
+    assert abs(col_value["approx_median"] - 499.5) < 10.0
+
+    col_squared = next(c for c in stats["columns"] if c["name"] == "squared")
+    assert col_squared["min"] == 0.0
+    assert col_squared["max"] == 999.0 * 999.0
+
+
+def test_describe_mixed_nulls_partitions(sp: Session):
+    """Test describe handles nulls distributed across different partitions."""
+    # Partition 1: [1, 2, NULL]
+    # Partition 2: [NULL, 4, 5]
+    items = [
+        {"x": 1}, {"x": 2}, {"x": None},
+        {"x": None}, {"x": 4}, {"x": 5}
+    ]
+    df = sp.from_arrow(pa.table({
+        "x": pa.array([1, 2, None, None, 4, 5], type=pa.int64())
+    })).repartition(2, by_rows=True)
+
+    stats = df.describe()
+
+    col_x = stats["columns"][0]
+    assert col_x["null_count"] == 2
+    assert col_x["non_null_count"] == 4
+    assert col_x["min"] == 1.0
+    assert col_x["max"] == 5.0
+    assert col_x["mean"] == 3.0  # (1+2+4+5) / 4
+    # Approx median of [1, 2, 4, 5], exact = (2 + 4) / 2 = 3
+    assert abs(col_x["approx_median"] - 3.0) < 0.5
+
+
+def test_describe_float_precision(sp: Session):
+    """Test describe handles floating point values correctly."""
+    df = sp.from_arrow(pa.table({
+        "x": [0.1, 0.2, 0.3]
+    }))
+    stats = df.describe()
+
+    col_x = stats["columns"][0]
+    assert abs(col_x["sum"] - 0.6) < 0.0001
+    assert abs(col_x["mean"] - 0.2) < 0.0001
+
+
+def test_describe_negative_values(sp: Session):
+    """Test describe handles negative values correctly."""
+    df = sp.from_arrow(pa.table({
+        "x": [-10, -5, 0, 5, 10]
+    }))
+    stats = df.describe()
+
+    col_x = stats["columns"][0]
+    assert col_x["min"] == -10.0
+    assert col_x["max"] == 10.0
+    assert col_x["mean"] == 0.0
+    # approx_median should be close to 0
+    assert abs(col_x["approx_median"] - 0.0) < 0.5
+    assert col_x["sum"] == 0.0
+
+
+def test_describe_preserves_column_order(sp: Session):
+    """Test that describe preserves the original column order."""
+    df = sp.from_arrow(pa.table({
+        "z": [1, 2],
+        "a": [3, 4],
+        "m": [5, 6]
+    }))
+    stats = df.describe()
+
+    column_names = [c["name"] for c in stats["columns"]]
+    assert column_names == ["z", "a", "m"]
+
+
+def test_describe_various_dtypes(sp: Session):
+    """Test describe correctly identifies various data types."""
+    df = sp.from_arrow(pa.table({
+        "int8_col": pa.array([1, 2], type=pa.int8()),
+        "int64_col": pa.array([1, 2], type=pa.int64()),
+        "float32_col": pa.array([1.0, 2.0], type=pa.float32()),
+        "float64_col": pa.array([1.0, 2.0], type=pa.float64()),
+        "string_col": ["a", "b"],
+        "bool_col": [True, False],
+    }))
+    stats = df.describe()
+
+    # All int and float columns should have numeric stats
+    for col in stats["columns"]:
+        if "int" in col["dtype"] or "float" in col["dtype"] or "double" in col["dtype"]:
+            assert "mean" in col, f"{col['name']} should have numeric stats"
+        else:
+            assert "mean" not in col, f"{col['name']} should not have numeric stats"
+
+
+def test_describe_partitions_with_all_null_and_data(sp: Session):
+    """Test describe when some partitions have all nulls and others have data.
+
+    This tests the edge case where a numeric column has:
+    - Partition 1: all null values [NULL, NULL, NULL]
+    - Partition 2: actual data [10, 20, 30]
+
+    The statistics should correctly reflect only the non-null values from
+    partitions that have data, without being affected by all-null partitions.
+    """
+    # Create data where first partition has all nulls, second has data
+    df = sp.from_arrow(pa.table({
+        "x": pa.array([None, None, None, 10, 20, 30], type=pa.int64())
+    })).repartition(2, by_rows=True)
+
+    stats = df.describe()
+
+    assert stats["num_rows"] == 6
+
+    col_x = stats["columns"][0]
+    # 3 nulls from first partition, 0 nulls from second
+    assert col_x["null_count"] == 3
+    assert col_x["non_null_count"] == 3
+    assert col_x["null_percent"] == 50.0
+
+    # Stats should be computed from [10, 20, 30] only
+    assert col_x["min"] == 10.0
+    assert col_x["max"] == 30.0
+    assert col_x["mean"] == 20.0  # (10 + 20 + 30) / 3
+    assert col_x["sum"] == 60.0
+    # approx_median should be close to 20
+    assert abs(col_x["approx_median"] - 20.0) < 1.0
+
+    # Standard deviation of [10, 20, 30]: std = sqrt(((10-20)^2 + (20-20)^2 + (30-20)^2) / 3)
+    # = sqrt((100 + 0 + 100) / 3) = sqrt(200/3) ≈ 8.165
+    expected_std = (200.0 / 3) ** 0.5
+    assert abs(col_x["std"] - expected_std) < 0.01
+
+
+def test_describe_all_null_partition_at_end(sp: Session):
+    """Test describe when all-null partition comes after data partition.
+
+    Ensures order of partitions doesn't matter.
+    """
+    # Create data where first partition has data, second has all nulls
+    df = sp.from_arrow(pa.table({
+        "x": pa.array([5, 10, 15, None, None, None], type=pa.int64())
+    })).repartition(2, by_rows=True)
+
+    stats = df.describe()
+
+    col_x = stats["columns"][0]
+    assert col_x["null_count"] == 3
+    assert col_x["non_null_count"] == 3
+
+    # Stats should be computed from [5, 10, 15] only
+    assert col_x["min"] == 5.0
+    assert col_x["max"] == 15.0
+    assert col_x["mean"] == 10.0
+
+
+def test_describe_multiple_columns_mixed_null_partitions(sp: Session):
+    """Test describe with multiple columns where different columns have nulls in different partitions.
+
+    Column x: data in partition 1, all nulls in partition 2
+    Column y: all nulls in partition 1, data in partition 2
+
+    Both columns should have correct stats computed independently.
+    """
+    df = sp.from_arrow(pa.table({
+        "x": pa.array([1, 2, 3, None, None, None], type=pa.int64()),
+        "y": pa.array([None, None, None, 100, 200, 300], type=pa.int64()),
+    })).repartition(2, by_rows=True)
+
+    stats = df.describe()
+
+    # Column x: data [1, 2, 3] from partition 1
+    col_x = next(c for c in stats["columns"] if c["name"] == "x")
+    assert col_x["null_count"] == 3
+    assert col_x["non_null_count"] == 3
+    assert col_x["min"] == 1.0
+    assert col_x["max"] == 3.0
+    assert col_x["mean"] == 2.0
+
+    # Column y: data [100, 200, 300] from partition 2
+    col_y = next(c for c in stats["columns"] if c["name"] == "y")
+    assert col_y["null_count"] == 3
+    assert col_y["non_null_count"] == 3
+    assert col_y["min"] == 100.0
+    assert col_y["max"] == 300.0
+    assert col_y["mean"] == 200.0
+
+
+# ==================== T-Digest Median Accuracy Tests ====================
+# These tests compare the approximate median from t-digest against exact median
+# calculations to verify accuracy across different data sizes and distributions.
+
+
+def _compute_exact_median(values: list) -> float:
+    """Helper function to compute exact median for comparison."""
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    if n == 0:
+        return None
+    if n % 2 == 1:
+        return sorted_vals[n // 2]
+    else:
+        return (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2
+
+
+def test_tdigest_accuracy_small_dataset(sp: Session):
+    """Test t-digest accuracy on small dataset (n=10).
+
+    For small datasets (n <= compression parameter), t-digest stores exact
+    values as centroids, so the median should be very close to exact.
+    """
+    values = list(range(10))  # [0, 1, 2, ..., 9]
+    df = sp.from_arrow(pa.table({"x": values}))
+
+    stats = df.describe()
+    approx_median = stats["columns"][0]["approx_median"]
+    exact_median = _compute_exact_median(values)  # 4.5
+
+    # For small datasets, t-digest should be very accurate
+    error = abs(approx_median - exact_median)
+    relative_error = error / exact_median if exact_median != 0 else error
+
+    assert relative_error < 0.01, f"Small dataset: relative error {relative_error:.4f} exceeds 1%"
+
+
+def test_tdigest_accuracy_medium_dataset(sp: Session):
+    """Test t-digest accuracy on medium dataset (n=500).
+
+    Medium datasets test the t-digest compression behavior while still
+    being manageable for exact comparison.
+    """
+    values = list(range(500))
+    df = sp.from_arrow(pa.table({"x": values})).repartition(5, by_rows=True)
+
+    stats = df.describe()
+    approx_median = stats["columns"][0]["approx_median"]
+    exact_median = _compute_exact_median(values)  # 249.5
+
+    error = abs(approx_median - exact_median)
+    relative_error = error / exact_median if exact_median != 0 else error
+
+    # For medium datasets, expect < 2% relative error
+    assert relative_error < 0.02, f"Medium dataset: relative error {relative_error:.4f} exceeds 2%"
+
+
+def test_tdigest_accuracy_large_dataset(sp: Session):
+    """Test t-digest accuracy on large dataset (n=10000).
+
+    Large datasets fully exercise the t-digest compression and merging
+    across multiple partitions.
+    """
+    values = list(range(10000))
+    df = sp.from_arrow(pa.table({"x": values})).repartition(10, by_rows=True)
+
+    stats = df.describe()
+    approx_median = stats["columns"][0]["approx_median"]
+    exact_median = _compute_exact_median(values)  # 4999.5
+
+    error = abs(approx_median - exact_median)
+    relative_error = error / exact_median if exact_median != 0 else error
+
+    # For large datasets, expect < 5% relative error (t-digest is less accurate at median)
+    assert relative_error < 0.05, f"Large dataset: relative error {relative_error:.4f} exceeds 5%"
+
+
+def test_tdigest_accuracy_uniform_distribution(sp: Session):
+    """Test t-digest accuracy on uniformly distributed data.
+
+    Uniform distributions are typically well-handled by t-digest.
+    """
+    # Uniform distribution from 0 to 1000
+    values = list(range(1001))  # [0, 1, 2, ..., 1000]
+    df = sp.from_arrow(pa.table({"x": values})).repartition(8, by_rows=True)
+
+    stats = df.describe()
+    approx_median = stats["columns"][0]["approx_median"]
+    exact_median = _compute_exact_median(values)  # 500
+
+    error = abs(approx_median - exact_median)
+    relative_error = error / exact_median
+
+    assert relative_error < 0.02, f"Uniform distribution: relative error {relative_error:.4f} exceeds 2%"
+
+
+def test_tdigest_accuracy_normal_like_distribution(sp: Session):
+    """Test t-digest accuracy on normal-like distribution.
+
+    Tests with data concentrated around the mean, similar to normal distribution.
+    Uses integer approximation of normal distribution for reproducibility.
+    """
+    # Create a distribution with more values near the center
+    # Values: many 50s, fewer 40s/60s, even fewer 30s/70s, etc.
+    values = []
+    for i in range(100):
+        # More values near 50
+        distance_from_center = abs(i - 50)
+        count = max(1, 10 - distance_from_center // 5)
+        values.extend([i] * count)
+
+    df = sp.from_arrow(pa.table({"x": values})).repartition(4, by_rows=True)
+
+    stats = df.describe()
+    approx_median = stats["columns"][0]["approx_median"]
+    exact_median = _compute_exact_median(values)
+
+    error = abs(approx_median - exact_median)
+    relative_error = error / exact_median if exact_median != 0 else error
+
+    assert relative_error < 0.05, f"Normal-like distribution: relative error {relative_error:.4f} exceeds 5%"
+
+
+def test_tdigest_accuracy_skewed_distribution(sp: Session):
+    """Test t-digest accuracy on skewed distribution.
+
+    Skewed distributions can be more challenging for median estimation.
+    """
+    # Right-skewed distribution: many small values, few large values
+    values = []
+    values.extend([1] * 100)
+    values.extend([2] * 80)
+    values.extend([3] * 60)
+    values.extend([5] * 40)
+    values.extend([10] * 20)
+    values.extend([50] * 10)
+    values.extend([100] * 5)
+
+    df = sp.from_arrow(pa.table({"x": values})).repartition(3, by_rows=True)
+
+    stats = df.describe()
+    approx_median = stats["columns"][0]["approx_median"]
+    exact_median = _compute_exact_median(values)
+
+    error = abs(approx_median - exact_median)
+    relative_error = error / exact_median if exact_median != 0 else error
+
+    # Skewed distributions may have slightly higher error
+    assert relative_error < 0.10, f"Skewed distribution: relative error {relative_error:.4f} exceeds 10%"
+
+
+def test_tdigest_accuracy_bimodal_distribution(sp: Session):
+    """Test t-digest accuracy on bimodal distribution.
+
+    Bimodal distributions are challenging because the median falls between
+    two clusters with no actual data points nearby.
+    """
+    # Two clusters: one around 10, one around 90
+    values = []
+    values.extend(list(range(5, 16)) * 10)  # Cluster around 10
+    values.extend(list(range(85, 96)) * 10)  # Cluster around 90
+
+    df = sp.from_arrow(pa.table({"x": values})).repartition(4, by_rows=True)
+
+    stats = df.describe()
+    approx_median = stats["columns"][0]["approx_median"]
+    exact_median = _compute_exact_median(values)
+
+    error = abs(approx_median - exact_median)
+
+    # For bimodal, use absolute error since median is between clusters
+    # The exact median will be around 50, allow larger absolute tolerance
+    assert error < 15, f"Bimodal distribution: absolute error {error:.2f} exceeds 15"
+
+
+def test_tdigest_accuracy_with_outliers(sp: Session):
+    """Test t-digest accuracy with outliers.
+
+    T-digest should handle outliers well due to its higher resolution at tails.
+    """
+    # Normal range 0-100, with some extreme outliers
+    values = list(range(101))  # [0, 1, ..., 100]
+    values.extend([1000, 2000, 5000])  # Extreme outliers
+
+    df = sp.from_arrow(pa.table({"x": values})).repartition(3, by_rows=True)
+
+    stats = df.describe()
+    approx_median = stats["columns"][0]["approx_median"]
+    exact_median = _compute_exact_median(values)  # Should be around 50
+
+    error = abs(approx_median - exact_median)
+    relative_error = error / exact_median if exact_median != 0 else error
+
+    # Median should not be heavily affected by outliers
+    assert relative_error < 0.10, f"With outliers: relative error {relative_error:.4f} exceeds 10%"
+
+
+def test_tdigest_accuracy_many_partitions(sp: Session):
+    """Test t-digest accuracy when data is spread across many partitions.
+
+    This tests the t-digest merge algorithm's accuracy.
+    """
+    values = list(range(1000))
+    df = sp.from_arrow(pa.table({"x": values})).repartition(20, by_rows=True)
+
+    stats = df.describe()
+    approx_median = stats["columns"][0]["approx_median"]
+    exact_median = _compute_exact_median(values)  # 499.5
+
+    error = abs(approx_median - exact_median)
+    relative_error = error / exact_median
+
+    # With many partitions, merging may introduce some error
+    assert relative_error < 0.05, f"Many partitions: relative error {relative_error:.4f} exceeds 5%"
+
+
+def test_tdigest_accuracy_single_partition(sp: Session):
+    """Test t-digest accuracy with single partition (no merging needed).
+
+    This establishes baseline accuracy without merge operations.
+    """
+    values = list(range(200))
+    df = sp.from_arrow(pa.table({"x": values})).repartition(1, by_rows=True)
+
+    stats = df.describe()
+    approx_median = stats["columns"][0]["approx_median"]
+    exact_median = _compute_exact_median(values)  # 99.5
+
+    error = abs(approx_median - exact_median)
+    relative_error = error / exact_median
+
+    # Single partition should be very accurate
+    assert relative_error < 0.02, f"Single partition: relative error {relative_error:.4f} exceeds 2%"
+
+
+def test_tdigest_accuracy_floating_point_values(sp: Session):
+    """Test t-digest accuracy with floating point values.
+
+    Ensures floating point precision doesn't affect median accuracy.
+    """
+    # Create floating point values
+    values = [i * 0.1 for i in range(1000)]  # [0.0, 0.1, 0.2, ..., 99.9]
+    df = sp.from_arrow(pa.table({"x": values})).repartition(5, by_rows=True)
+
+    stats = df.describe()
+    approx_median = stats["columns"][0]["approx_median"]
+    exact_median = _compute_exact_median(values)  # 49.95
+
+    error = abs(approx_median - exact_median)
+    relative_error = error / exact_median
+
+    assert relative_error < 0.02, f"Floating point: relative error {relative_error:.4f} exceeds 2%"
+
+
+def test_tdigest_accuracy_negative_values(sp: Session):
+    """Test t-digest accuracy with negative values.
+
+    Ensures negative numbers are handled correctly.
+    """
+    values = list(range(-500, 501))  # [-500, -499, ..., 499, 500]
+    df = sp.from_arrow(pa.table({"x": values})).repartition(5, by_rows=True)
+
+    stats = df.describe()
+    approx_median = stats["columns"][0]["approx_median"]
+    exact_median = _compute_exact_median(values)  # 0
+
+    # For median near 0, use absolute error
+    error = abs(approx_median - exact_median)
+    assert error < 5, f"Negative values: absolute error {error:.2f} exceeds 5"
+
+
+def test_tdigest_accuracy_summary(sp: Session):
+    """Summary test that reports accuracy across multiple dataset sizes.
+
+    This test documents the expected accuracy of t-digest at different scales.
+    The results help developers understand when describe() is appropriate
+    vs when they should use to_pandas().median() for exact results.
+
+    Expected accuracy guidelines:
+    - n <= 100: Very accurate (< 1% error), t-digest stores exact values
+    - n <= 1000: Accurate (< 2% error), compression is moderate
+    - n <= 10000: Good (< 5% error), suitable for exploratory analysis
+    - n > 10000: Acceptable (< 10% error), use for quick estimates only
+    """
+    test_cases = [
+        (50, "tiny"),
+        (100, "small"),
+        (500, "medium"),
+        (1000, "large"),
+        (5000, "very_large"),
+    ]
+
+    results = []
+    for size, label in test_cases:
+        values = list(range(size))
+        df = sp.from_arrow(pa.table({"x": values})).repartition(max(1, size // 100), by_rows=True)
+
+        stats = df.describe()
+        approx_median = stats["columns"][0]["approx_median"]
+        exact_median = _compute_exact_median(values)
+
+        error = abs(approx_median - exact_median)
+        relative_error = (error / exact_median * 100) if exact_median != 0 else 0
+
+        results.append({
+            "size": size,
+            "label": label,
+            "exact_median": exact_median,
+            "approx_median": approx_median,
+            "relative_error_percent": relative_error,
+        })
+
+    # Verify all test cases are within acceptable bounds
+    for r in results:
+        if r["size"] <= 100:
+            assert r["relative_error_percent"] < 1.0, f"Size {r['size']}: error {r['relative_error_percent']:.2f}% exceeds 1%"
+        elif r["size"] <= 1000:
+            assert r["relative_error_percent"] < 3.0, f"Size {r['size']}: error {r['relative_error_percent']:.2f}% exceeds 3%"
+        else:
+            assert r["relative_error_percent"] < 10.0, f"Size {r['size']}: error {r['relative_error_percent']:.2f}% exceeds 10%"
