@@ -2191,3 +2191,255 @@ def test_tdigest_accuracy_summary(sp: Session):
             assert r["relative_error_percent"] < 3.0, f"Size {r['size']}: error {r['relative_error_percent']:.2f}% exceeds 3%"
         else:
             assert r["relative_error_percent"] < 10.0, f"Size {r['size']}: error {r['relative_error_percent']:.2f}% exceeds 10%"
+
+
+# ============================================================================
+# Tests for require_non_null() validation feature
+# ============================================================================
+
+
+def test_require_non_null_passes_when_no_nulls(sp: Session):
+    """Test that require_non_null passes when columns have no null values."""
+    df = sp.from_arrow(pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]}))
+    df = df.require_non_null("id")
+
+    # Should not raise an error
+    assert df.count() == 3
+    assert len(df.take(10)) == 3
+    assert len(df.to_pandas()) == 3
+    assert df.to_arrow().num_rows == 3
+
+
+def test_require_non_null_fails_when_nulls_exist(sp: Session):
+    """Test that require_non_null raises NullValidationError when nulls exist."""
+    from smallpond.dataframe import NullValidationError
+
+    df = sp.from_arrow(pa.table({
+        "id": pa.array([1, None, 3], type=pa.int64()),
+        "name": ["a", "b", "c"]
+    }))
+    df = df.require_non_null("id")
+
+    # Should raise NullValidationError
+    with pytest.raises(NullValidationError) as exc_info:
+        df.count()
+
+    error = exc_info.value
+    assert "id" in error.columns
+    assert error.null_counts["id"] == 1
+    assert "'id' (1 nulls)" in str(error)
+
+
+def test_require_non_null_multiple_columns(sp: Session):
+    """Test require_non_null with multiple columns."""
+    from smallpond.dataframe import NullValidationError
+
+    df = sp.from_arrow(pa.table({
+        "id": pa.array([1, None, 3], type=pa.int64()),
+        "email": pa.array(["a@test.com", "b@test.com", None], type=pa.string()),
+        "name": ["a", "b", "c"]
+    }))
+    df = df.require_non_null(["id", "email"])
+
+    with pytest.raises(NullValidationError) as exc_info:
+        df.take(10)
+
+    error = exc_info.value
+    assert "id" in error.columns
+    assert "email" in error.columns
+    assert error.null_counts["id"] == 1
+    assert error.null_counts["email"] == 1
+
+
+def test_require_non_null_chained_calls(sp: Session):
+    """Test that multiple require_non_null calls accumulate columns."""
+    from smallpond.dataframe import NullValidationError
+
+    df = sp.from_arrow(pa.table({
+        "id": pa.array([1, None, 3], type=pa.int64()),
+        "email": pa.array(["a@test.com", "b@test.com", None], type=pa.string()),
+        "name": ["a", "b", "c"]
+    }))
+    df = df.require_non_null("id").require_non_null("email")
+
+    with pytest.raises(NullValidationError) as exc_info:
+        df.to_pandas()
+
+    error = exc_info.value
+    assert "id" in error.columns
+    assert "email" in error.columns
+
+
+def test_require_non_null_preserves_through_filter(sp: Session):
+    """Test that non-null constraints are preserved through filter operations."""
+    from smallpond.dataframe import NullValidationError
+
+    df = sp.from_arrow(pa.table({
+        "id": pa.array([1, None, 3, 4], type=pa.int64()),
+        "value": [10, 20, 30, 40]
+    }))
+    df = df.require_non_null("id").filter("value > 15")
+
+    # After filter, only rows with value > 15 remain: (None, 20), (3, 30), (4, 40)
+    # The null in 'id' is still there
+    with pytest.raises(NullValidationError):
+        df.count()
+
+
+def test_require_non_null_preserves_through_map(sp: Session):
+    """Test that non-null constraints are preserved through map operations."""
+    from smallpond.dataframe import NullValidationError
+
+    df = sp.from_arrow(pa.table({
+        "id": pa.array([1, None, 3], type=pa.int64()),
+        "value": [10, 20, 30]
+    }))
+    df = df.require_non_null("id").map("id, value * 2 as doubled")
+
+    with pytest.raises(NullValidationError):
+        df.to_arrow()
+
+
+def test_require_non_null_preserves_through_repartition(sp: Session):
+    """Test that non-null constraints are preserved through repartition."""
+    from smallpond.dataframe import NullValidationError
+
+    df = sp.from_arrow(pa.table({
+        "id": pa.array([1, None, 3, 4, 5], type=pa.int64()),
+        "value": [10, 20, 30, 40, 50]
+    }))
+    df = df.require_non_null("id").repartition(2, by_rows=True)
+
+    with pytest.raises(NullValidationError):
+        df.count()
+
+
+def test_require_non_null_describe_skips_validation(sp: Session):
+    """Test that describe() skips non-null validation to allow data exploration."""
+    df = sp.from_arrow(pa.table({
+        "id": pa.array([1, None, 3], type=pa.int64()),
+        "value": [10, 20, 30]
+    }))
+    df = df.require_non_null("id")
+
+    # describe() should NOT raise an error - it's used for data exploration
+    stats = df.describe()
+    assert stats["num_rows"] == 3
+    # Check that describe correctly reports the null count
+    id_col = next(c for c in stats["columns"] if c["name"] == "id")
+    assert id_col["null_count"] == 1
+
+
+def test_require_non_null_with_join(sp: Session):
+    """Test that non-null constraints from both DataFrames are merged in join."""
+    from smallpond.dataframe import NullValidationError
+
+    df1 = sp.from_arrow(pa.table({
+        "id": pa.array([1, 2, 3], type=pa.int64()),
+        "value": pa.array([10, None, 30], type=pa.int64())
+    })).require_non_null("value")
+
+    df2 = sp.from_arrow(pa.table({
+        "id": pa.array([1, 2, 3], type=pa.int64()),
+        "name": pa.array(["a", "b", None], type=pa.string())
+    })).require_non_null("name")
+
+    joined = df1.join(df2, on="id")
+
+    with pytest.raises(NullValidationError) as exc_info:
+        joined.take(10)
+
+    error = exc_info.value
+    # Both 'value' from df1 and 'name' from df2 should be in the non-null columns
+    assert "value" in error.columns
+    assert "name" in error.columns
+
+
+def test_require_non_null_column_not_exists(sp: Session):
+    """Test that specifying a non-existent column raises ValueError immediately."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2, 3],
+        "name": ["a", "b", "c"]
+    }))
+
+    # Error should be raised immediately at require_non_null() time,
+    # not at count() time, for early typo detection
+    with pytest.raises(ValueError) as exc_info:
+        df.require_non_null("nonexistent_column")
+
+    assert "nonexistent_column" in str(exc_info.value)
+    assert "do not exist" in str(exc_info.value)
+    assert "Available columns" in str(exc_info.value)
+
+
+def test_require_non_null_column_not_exists_with_filter(sp: Session):
+    """Test that early validation works through schema-preserving transformations."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2, 3],
+        "name": ["a", "b", "c"]
+    }))
+
+    # Filter preserves schema, so early validation should still work
+    filtered_df = df.filter("id > 1")
+
+    with pytest.raises(ValueError) as exc_info:
+        filtered_df.require_non_null("nonexistent_column")
+
+    assert "nonexistent_column" in str(exc_info.value)
+
+
+def test_require_non_null_cached_results(sp: Session):
+    """Test that validation is performed even for cached results."""
+    from smallpond.dataframe import NullValidationError
+
+    df = sp.from_arrow(pa.table({
+        "id": pa.array([1, None, 3], type=pa.int64()),
+        "value": [10, 20, 30]
+    }))
+
+    # First, compute without validation to populate cache
+    count_no_validation = df.count()
+    assert count_no_validation == 3
+
+    # Now add validation and try to access data
+    df_validated = df.require_non_null("id")
+
+    # Should still raise error even though underlying data is cached
+    with pytest.raises(NullValidationError):
+        df_validated.count()
+
+
+def test_require_non_null_returns_self(sp: Session):
+    """Test that require_non_null returns self for method chaining."""
+    df = sp.from_arrow(pa.table({"id": [1, 2, 3]}))
+    result = df.require_non_null("id")
+    assert result is df
+
+
+def test_require_non_null_no_duplicates(sp: Session):
+    """Test that calling require_non_null with same column doesn't create duplicates."""
+    df = sp.from_arrow(pa.table({"id": [1, 2, 3]}))
+    df.require_non_null("id").require_non_null("id").require_non_null("id")
+    # _non_null_columns is a frozenset, so duplicates are inherently prevented
+    assert len(df._non_null_columns) == 1
+    assert "id" in df._non_null_columns
+
+
+def test_null_validation_error_message(sp: Session):
+    """Test that NullValidationError has informative message."""
+    from smallpond.dataframe import NullValidationError
+
+    df = sp.from_arrow(pa.table({
+        "id": pa.array([1, None, None, 4], type=pa.int64()),
+        "email": pa.array(["a@test.com", None, "c@test.com", None], type=pa.string()),
+    }))
+    df = df.require_non_null(["id", "email"])
+
+    with pytest.raises(NullValidationError) as exc_info:
+        df.count()
+
+    error_msg = str(exc_info.value)
+    assert "id" in error_msg
+    assert "2 nulls" in error_msg
+    assert "email" in error_msg
+    assert "require_non_null()" in error_msg

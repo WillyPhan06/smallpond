@@ -25,6 +25,83 @@ from smallpond.logical.planner import Planner
 from smallpond.session import SessionBase
 
 
+class NullValidationError(ValueError):
+    """
+    Exception raised when non-null validation fails for specified columns.
+
+    This exception is raised when columns marked as required non-null via
+    `require_non_null()` contain null values during data retrieval operations
+    like `take()`, `to_pandas()`, `to_arrow()`, or `count()`.
+
+    Attributes
+    ----------
+    columns : List[str]
+        The column names that were required to be non-null.
+    null_counts : Dict[str, int]
+        A dictionary mapping column names to their null value counts.
+    message : str
+        A descriptive error message.
+
+    Notes
+    -----
+    **Why inherit from ValueError?**
+
+    This exception inherits from `ValueError` rather than a custom base exception
+    for the following reasons:
+
+    1. **Semantic alignment**: `ValueError` is raised when an operation receives
+       an argument with the right type but an inappropriate value. In this case,
+       the DataFrame's data has an inappropriate value (null) where non-null was
+       required. The "value" being validated is the data content itself.
+
+    2. **Consistency with pandas**: pandas raises `ValueError` for similar data
+       quality issues (e.g., when `dropna()` would result in empty data with
+       certain parameters, or when data doesn't meet expected constraints).
+
+    3. **Catchability**: Users can catch this as `ValueError` for broad error
+       handling, or specifically as `NullValidationError` for targeted handling.
+       This follows Python's exception hierarchy conventions.
+
+    4. **Not a programming error**: While `ValueError` is sometimes associated
+       with programming errors, it's also commonly used for runtime data validation
+       failures. The distinction is that `TypeError` is for wrong types (programming
+       error), while `ValueError` is for wrong values (which can be data-driven).
+
+    Example of catching both broadly and specifically:
+
+    .. code-block::
+
+        # Catch specifically
+        try:
+            df.require_non_null("id").to_pandas()
+        except NullValidationError as e:
+            print(f"Data quality issue: {e.null_counts}")
+
+        # Catch broadly with other value errors
+        try:
+            df.require_non_null("id").to_pandas()
+        except ValueError as e:
+            print(f"Value error: {e}")
+    """
+
+    def __init__(self, columns: List[str], null_counts: Dict[str, int]):
+        self.columns = columns
+        self.null_counts = null_counts
+
+        # Build descriptive message
+        failed_cols = [col for col in columns if null_counts.get(col, 0) > 0]
+        details = ", ".join(f"'{col}' ({null_counts[col]} nulls)" for col in failed_cols)
+        self.message = (
+            f"Non-null validation failed for columns: {details}. "
+            f"These columns were marked as required non-null via require_non_null() but contain null values. "
+            f"Please clean your data or adjust the non-null requirements."
+        )
+        super().__init__(self.message)
+
+    def __str__(self) -> str:
+        return self.message
+
+
 class DataFrameCache:
     """
     A cache for storing computed DataFrame results.
@@ -531,7 +608,7 @@ class DataFrame:
     Internally, it's a wrapper around a `Node` and a `Session` required for execution.
     """
 
-    def __init__(self, session: Session, plan: Node, recompute: bool = False, use_cache: bool = True):
+    def __init__(self, session: Session, plan: Node, recompute: bool = False, use_cache: bool = True, non_null_columns: Optional[frozenset] = None):
         self.session = session
         self.plan = plan
         self.optimized_plan: Optional[Node] = None
@@ -541,6 +618,15 @@ class DataFrame:
         """Whether to use caching for this DataFrame's computations."""
         self._compute_lock = Lock()
         """Lock to ensure thread-safe access to optimized_plan during _compute()."""
+        self._non_null_columns: frozenset = non_null_columns if non_null_columns is not None else frozenset()
+        """
+        Columns that must not contain null values when data is retrieved.
+
+        Uses frozenset for O(1) membership testing and immutability. Since frozenset
+        is immutable, it can be safely shared between parent and child DataFrames
+        without copying. When new columns are added via require_non_null(), a new
+        frozenset is created using union operation.
+        """
 
         session._nodes.append(plan)
 
@@ -593,7 +679,7 @@ class DataFrame:
         """
         self._compute()
 
-    def _compute(self, use_cache: Optional[bool] = None) -> List[DataSet]:
+    def _compute(self, use_cache: Optional[bool] = None, skip_validation: bool = False) -> List[DataSet]:
         """
         Compute the data and return the datasets.
 
@@ -607,6 +693,9 @@ class DataFrame:
             If None, uses the DataFrame's default cache setting.
             If True, will check the cache first and store results in cache.
             If False, will bypass the cache entirely.
+        skip_validation : bool, default False
+            If True, skip the non-null column validation. This is used internally
+            by methods like describe() that need to compute data without validation.
         """
         # Determine if we should use cache
         should_use_cache = use_cache if use_cache is not None else self._use_cache
@@ -624,6 +713,9 @@ class DataFrame:
             if should_use_cache and not self.need_recompute:
                 cached_result = self.session._cache.get(self.optimized_plan)
                 if cached_result is not None:
+                    # Validate non-null columns even for cached results
+                    if not skip_validation:
+                        self._validate_non_null_columns(cached_result)
                     return cached_result
 
             # Compute the data
@@ -634,6 +726,10 @@ class DataFrame:
                     # Store in cache if caching is enabled
                     if should_use_cache:
                         self.session._cache.put(self.optimized_plan, result)
+
+                    # Validate non-null columns before returning
+                    if not skip_validation:
+                        self._validate_non_null_columns(result)
 
                     return result
                 except ray.exceptions.RuntimeEnvSetupError as e:
@@ -726,6 +822,232 @@ class DataFrame:
             return self.session._cache.invalidate(self.optimized_plan)
         return 0
 
+    def _try_get_column_names(self) -> Optional[List[str]]:
+        """
+        Attempt to get column names from the DataFrame's plan without triggering computation.
+
+        This method tries to extract column names from the underlying data source if possible.
+        It works for DataFrames created directly from data sources (parquet, CSV, JSON, pandas,
+        arrow) but may not work for DataFrames that have undergone transformations that change
+        the schema (like map operations with new columns).
+
+        Returns
+        -------
+        Optional[List[str]]
+            A list of column names if they can be determined without computation,
+            or None if the schema cannot be determined cheaply.
+
+        Notes
+        -----
+        This is a best-effort method. For complex transformation chains, it returns None
+        and validation will happen at compute time instead.
+        """
+        from smallpond.logical.dataset import (
+            ArrowTableDataSet,
+            CsvDataSet,
+            JsonDataSet,
+            PandasDataSet,
+            ParquetDataSet,
+        )
+
+        # Try to find the root DataSourceNode
+        node = self.plan
+        while node is not None:
+            if isinstance(node, DataSourceNode):
+                dataset = node.dataset
+                # Handle different dataset types
+                if isinstance(dataset, ArrowTableDataSet):
+                    return [field.name for field in dataset.table.schema]
+                elif isinstance(dataset, PandasDataSet):
+                    return list(dataset.df.columns)
+                elif isinstance(dataset, (CsvDataSet, JsonDataSet)):
+                    # These have explicit schema dictionaries
+                    return list(dataset.schema.keys())
+                elif isinstance(dataset, ParquetDataSet):
+                    # For parquet, we can read schema from metadata without loading data
+                    try:
+                        import pyarrow.parquet as parquet
+                        resolved_paths = dataset.resolved_paths
+                        if resolved_paths:
+                            # Read just the schema from the first file's metadata
+                            parquet_file = parquet.ParquetFile(resolved_paths[0])
+                            return [field.name for field in parquet_file.schema_arrow]
+                    except Exception:
+                        # If we can't read metadata, fall back to late validation
+                        pass
+                return None
+
+            # For transformation nodes, try to follow the input dependency chain
+            # But only for transformations that preserve schema (filter, limit, etc.)
+            if hasattr(node, 'input_deps') and node.input_deps:
+                # For nodes with a single input that preserve schema, follow the chain
+                # This works for: filter, limit, repartition, partial_sort, etc.
+                if len(node.input_deps) == 1:
+                    node = node.input_deps[0]
+                else:
+                    # Multiple inputs (like join) - schema is complex, give up
+                    return None
+            else:
+                return None
+
+        return None
+
+    def require_non_null(self, columns: Union[str, List[str]]) -> DataFrame:
+        """
+        Mark columns as required to be non-null.
+
+        When data is retrieved from this DataFrame via operations like `take()`,
+        `to_pandas()`, `to_arrow()`, or `count()`, the specified columns will be
+        validated to ensure they contain no null values. If null values are found,
+        a `NullValidationError` will be raised.
+
+        This is useful for ensuring data quality early in the pipeline, especially
+        for critical columns like IDs or foreign keys that should never be null.
+
+        Parameters
+        ----------
+        columns : str or List[str]
+            A single column name or a list of column names that must not contain
+            null values. The validation is additive - if `require_non_null()` is
+            called multiple times, all specified columns will be validated.
+
+        Returns
+        -------
+        DataFrame
+            Returns self for method chaining.
+
+        Raises
+        ------
+        NullValidationError
+            Raised when any of the specified columns contain null values during
+            data retrieval operations. The exception includes details about which
+            columns failed validation and how many null values were found.
+
+        Examples
+        --------
+        Mark a single column as required non-null:
+
+        .. code-block::
+
+            df = sp.read_parquet("data/*.parquet").require_non_null("id")
+            df.take(10)  # Will raise NullValidationError if 'id' has nulls
+
+        Mark multiple columns:
+
+        .. code-block::
+
+            df = df.require_non_null(["id", "user_id", "timestamp"])
+
+        Chain with other operations:
+
+        .. code-block::
+
+            df = (sp.read_parquet("data/*.parquet")
+                  .filter("status = 'active'")
+                  .require_non_null(["id", "email"])
+                  .map("id, email, name"))
+
+            # Any of these operations will validate the columns:
+            df.count()       # Validates before counting
+            df.take(100)     # Validates before returning rows
+            df.to_pandas()   # Validates before converting
+            df.to_arrow()    # Validates before converting
+
+        Handling validation errors:
+
+        .. code-block::
+
+            try:
+                df.require_non_null("id").to_pandas()
+            except NullValidationError as e:
+                print(f"Validation failed: {e}")
+                print(f"Columns with nulls: {e.null_counts}")
+
+        Notes
+        -----
+        - The non-null constraint is preserved through method chaining. When you call
+          transformation methods like `filter()`, `map()`, or `repartition()`, the
+          resulting DataFrame will inherit the non-null requirements.
+        - **Early column validation**: When possible, this method validates that the
+          specified columns exist in the DataFrame immediately (without triggering
+          computation). This catches typos and invalid column names early. For simple
+          DataFrames (direct from data sources like parquet, CSV, pandas, arrow) and
+          DataFrames with schema-preserving transformations (filter, limit, repartition),
+          column existence is validated immediately.
+        - For complex transformations that change the schema (like map with new columns),
+          column validation happens at data retrieval time instead.
+        - The validation checks all partitions, so null values in any partition
+          will trigger the error.
+        - Internally uses a `frozenset` for O(1) membership testing. This ensures
+          efficient duplicate checking regardless of how many columns are validated.
+
+        Raises
+        ------
+        ValueError
+            Raised immediately if the specified columns don't exist in the DataFrame
+            and the schema can be determined without computation. This helps catch
+            typos early.
+        """
+        if isinstance(columns, str):
+            columns = [columns]
+
+        # Try to validate columns exist early (without triggering computation)
+        known_columns = self._try_get_column_names()
+        if known_columns is not None:
+            known_columns_set = set(known_columns)
+            invalid_columns = [col for col in columns if col not in known_columns_set]
+            if invalid_columns:
+                raise ValueError(
+                    f"Column(s) {invalid_columns} specified in require_non_null() do not exist in the DataFrame. "
+                    f"Available columns: {known_columns}"
+                )
+
+        # Create new frozenset with union of existing and new columns
+        # frozenset is immutable, so this creates a new set rather than mutating
+        self._non_null_columns = self._non_null_columns | frozenset(columns)
+
+        return self
+
+    def _validate_non_null_columns(self, datasets: List[DataSet]) -> None:
+        """
+        Validate that columns marked as non-null contain no null values.
+
+        Parameters
+        ----------
+        datasets : List[DataSet]
+            The computed datasets to validate.
+
+        Raises
+        ------
+        NullValidationError
+            If any of the non-null columns contain null values.
+        """
+        if not self._non_null_columns:
+            return
+
+        # Collect null counts for each required column across all partitions
+        null_counts: Dict[str, int] = {col: 0 for col in self._non_null_columns}
+
+        for dataset in datasets:
+            arrow_table = dataset.to_arrow_table()
+            schema = arrow_table.schema
+
+            for col_name in self._non_null_columns:
+                try:
+                    col_idx = schema.get_field_index(col_name)
+                    col_array = arrow_table.column(col_idx)
+                    null_counts[col_name] += col_array.null_count
+                except KeyError:
+                    raise ValueError(
+                        f"Column '{col_name}' specified in require_non_null() does not exist in the DataFrame. "
+                        f"Available columns: {[field.name for field in schema]}"
+                    )
+
+        # Check if any column has null values
+        columns_with_nulls = [col for col, count in null_counts.items() if count > 0]
+        if columns_with_nulls:
+            raise NullValidationError(list(self._non_null_columns), null_counts)
+
     def repartition(
         self,
         npartitions: int,
@@ -778,7 +1100,7 @@ class DataFrame:
                 partition_by_rows=by_rows,
                 **kwargs,
             )
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache)
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
 
     def random_shuffle(self, **kwargs) -> DataFrame:
         """
@@ -798,7 +1120,7 @@ class DataFrame:
             r"select * from {0} order by random()",
             **kwargs,
         )
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache)
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
 
     def partial_sort(self, by: Union[str, List[str]], **kwargs) -> DataFrame:
         """
@@ -824,7 +1146,7 @@ class DataFrame:
             f"select * from {{0}} order by {', '.join(by)}",
             **kwargs,
         )
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache)
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
 
     def filter(self, sql_or_func: Union[str, Callable[[Dict[str, Any]], bool]], **kwargs) -> DataFrame:
         """
@@ -860,7 +1182,7 @@ class DataFrame:
             plan = ArrowBatchNode(self.session._ctx, (self.plan,), process_func=process_func, **kwargs)
         else:
             raise ValueError("condition must be a SQL expression or a predicate function")
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache)
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
 
     def map(
         self,
@@ -920,7 +1242,7 @@ class DataFrame:
             plan = ArrowBatchNode(self.session._ctx, (self.plan,), process_func=process_func, **kwargs)
         else:
             raise ValueError(f"must be a SQL expression or a function: {sql_or_func!r}")
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache)
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
 
     def flat_map(
         self,
@@ -961,7 +1283,7 @@ class DataFrame:
             plan = ArrowBatchNode(self.session._ctx, (self.plan,), process_func=process_func, **kwargs)
         else:
             raise ValueError(f"must be a SQL expression or a function: {sql_or_func!r}")
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache)
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
 
     def map_batches(
         self,
@@ -992,7 +1314,7 @@ class DataFrame:
             streaming_batch_size=batch_size,
             **kwargs,
         )
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache)
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
 
     def limit(self, limit: int) -> DataFrame:
         """
@@ -1001,7 +1323,7 @@ class DataFrame:
         Unlike `take`, this method doesn't trigger execution.
         """
         plan = LimitNode(self.session._ctx, self.plan, limit)
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache)
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
 
     def join(
         self,
@@ -1174,7 +1496,9 @@ class DataFrame:
             sql,
         )
         recompute = self.need_recompute or other.need_recompute
-        return DataFrame(self.session, plan, recompute=recompute, use_cache=self._use_cache)
+        # Merge non-null columns from both DataFrames using frozenset union
+        merged_non_null = self._non_null_columns | other._non_null_columns
+        return DataFrame(self.session, plan, recompute=recompute, use_cache=self._use_cache, non_null_columns=merged_non_null if merged_non_null else None)
 
     def _build_join_sql(
         self,
@@ -1392,7 +1716,7 @@ class DataFrame:
             (grouped_df.plan,),
             partial_agg_sql,
         )
-        partial_df = DataFrame(self.session, partial_plan, recompute=self.need_recompute, use_cache=self._use_cache)
+        partial_df = DataFrame(self.session, partial_plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
 
         # Phase 2: Collect all partial results into a single partition and compute final aggregates
         # Use repartition(1) to collect all partial results, then apply final aggregation
@@ -1404,7 +1728,7 @@ class DataFrame:
             final_agg_sql,
         )
 
-        return DataFrame(self.session, final_plan, recompute=self.need_recompute, use_cache=self._use_cache)
+        return DataFrame(self.session, final_plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
 
     def _build_groupby_agg_sql(
         self,
@@ -1570,6 +1894,13 @@ class DataFrame:
           - Is suitable for large-scale distributed data where exact median
             computation would require collecting all values in memory
 
+        - **Note on non-null validation**: The `describe()` method skips non-null
+          validation set via `require_non_null()`. This is intentional because
+          `describe()` is typically used to explore and understand data quality,
+          including identifying columns with null values. Use `describe()` to
+          check null counts before deciding which columns to mark as required
+          non-null.
+
         - **When to use describe() vs to_pandas().median()**:
 
           +------------------+------------------+------------------+-------------------+
@@ -1613,7 +1944,8 @@ class DataFrame:
         - Partitions with all-null values for a column are handled correctly and
           do not affect the statistics of partitions that have valid data.
         """
-        datasets = self._compute()
+        # Skip validation for describe() - it's used to explore data quality
+        datasets = self._compute(skip_validation=True)
 
         # Handle empty DataFrame case (no datasets at all)
         if not datasets:
@@ -2112,7 +2444,7 @@ class DataFrame:
         sql = f"SELECT * FROM {{0}} USING SAMPLE {sample_spec} ({sample_method}{seed_clause})"
 
         plan = SqlEngineNode(self.session._ctx, (self.plan,), sql)
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache).take_all()
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None).take_all()
 
     def write_parquet(self, path: str) -> None:
         """
@@ -2144,7 +2476,7 @@ class DataFrame:
         """
 
         plan = DataSinkNode(self.session._ctx, (self.plan,), os.path.abspath(path), type="link_or_copy")
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache)
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
 
     # inspection
 
