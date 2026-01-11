@@ -3105,3 +3105,262 @@ def test_union_type_get_type_category_function(sp: Session):
     # Unknown types should return "other"
     assert DataFrame._get_type_category("unknown_type") == "other"
     assert DataFrame._get_type_category("struct<a: int>") == "other"
+
+
+# ==================== Drop Duplicates Tests ====================
+
+
+def test_drop_duplicates_all_columns(sp: Session):
+    """Test drop_duplicates on all columns (default)."""
+    df = sp.from_arrow(pa.table({
+        "a": [1, 2, 1, 2, 1],
+        "b": [10, 20, 10, 20, 30]
+    }))
+    result = df.drop_duplicates()
+    rows = sorted(result.take_all(), key=lambda x: (x["a"], x["b"]))
+    assert len(rows) == 3
+    assert rows[0] == {"a": 1, "b": 10}
+    assert rows[1] == {"a": 1, "b": 30}
+    assert rows[2] == {"a": 2, "b": 20}
+
+
+def test_drop_duplicates_subset_single_column(sp: Session):
+    """Test drop_duplicates on a single column subset (default keeps first)."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 1, 2, 2, 3],
+        "name": ["Alice", "Bob", "Carol", "Dave", "Eve"]
+    }))
+    result = df.drop_duplicates(subset="id")
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+    assert len(rows) == 3
+    # Default is keep='first', so first occurrence is kept
+    assert rows[0] == {"id": 1, "name": "Alice"}  # First occurrence of id=1
+    assert rows[1] == {"id": 2, "name": "Carol"}  # First occurrence of id=2
+    assert rows[2] == {"id": 3, "name": "Eve"}
+
+
+def test_drop_duplicates_subset_multiple_columns(sp: Session):
+    """Test drop_duplicates on multiple columns subset."""
+    df = sp.from_arrow(pa.table({
+        "a": [1, 1, 1, 2, 2],
+        "b": [1, 1, 2, 1, 1],
+        "c": ["x", "y", "z", "w", "v"]
+    }))
+    result = df.drop_duplicates(subset=["a", "b"])
+    rows = sorted(result.take_all(), key=lambda x: (x["a"], x["b"]))
+    assert len(rows) == 3
+    assert rows[0]["a"] == 1 and rows[0]["b"] == 1
+    assert rows[1]["a"] == 1 and rows[1]["b"] == 2
+    assert rows[2]["a"] == 2 and rows[2]["b"] == 1
+
+
+def test_drop_duplicates_keep_first(sp: Session):
+    """Test drop_duplicates keeping the first occurrence."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 1, 1],
+        "value": [100, 200, 300]
+    }))
+    result = df.drop_duplicates(subset="id", keep="first")
+    rows = result.take_all()
+    assert len(rows) == 1
+    assert rows[0]["id"] == 1
+    assert rows[0]["value"] == 100
+
+
+def test_drop_duplicates_keep_last(sp: Session):
+    """Test drop_duplicates keeping the last occurrence."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 1, 1],
+        "value": [100, 200, 300]
+    }))
+    result = df.drop_duplicates(subset="id", keep="last")
+    rows = result.take_all()
+    assert len(rows) == 1
+    assert rows[0]["id"] == 1
+    assert rows[0]["value"] == 300
+
+
+def test_drop_duplicates_keep_any(sp: Session):
+    """Test drop_duplicates keeping any row (for performance optimization)."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 1, 2],
+        "value": [10, 20, 30]
+    }))
+    result = df.drop_duplicates(subset="id", keep="any")
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+    assert len(rows) == 2
+    assert rows[0]["id"] == 1
+    assert rows[1]["id"] == 2
+    assert rows[1]["value"] == 30
+
+
+def test_drop_duplicates_no_duplicates(sp: Session):
+    """Test drop_duplicates when there are no duplicates."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Carol"]
+    }))
+    result = df.drop_duplicates()
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+    assert len(rows) == 3
+    assert rows[0] == {"id": 1, "name": "Alice"}
+    assert rows[1] == {"id": 2, "name": "Bob"}
+    assert rows[2] == {"id": 3, "name": "Carol"}
+
+
+def test_drop_duplicates_all_duplicates(sp: Session):
+    """Test drop_duplicates when all rows are duplicates."""
+    df = sp.from_arrow(pa.table({
+        "a": [1, 1, 1],
+        "b": [2, 2, 2]
+    }))
+    result = df.drop_duplicates()
+    rows = result.take_all()
+    assert len(rows) == 1
+    assert rows[0] == {"a": 1, "b": 2}
+
+
+def test_drop_duplicates_empty_dataframe(sp: Session):
+    """Test drop_duplicates on an empty DataFrame."""
+    df = sp.from_arrow(pa.table({
+        "id": pa.array([], type=pa.int64()),
+        "name": pa.array([], type=pa.string())
+    }))
+    result = df.drop_duplicates()
+    rows = result.take_all()
+    assert len(rows) == 0
+
+
+def test_drop_duplicates_with_nulls(sp: Session):
+    """Test drop_duplicates with null values."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 1, None, None, 2],
+        "val": ["a", "a", "b", "b", "c"]
+    }))
+    result = df.drop_duplicates()
+    rows = result.take_all()
+    # Should have 3 unique rows: (1, a), (None, b), (2, c)
+    assert len(rows) == 3
+
+
+def test_drop_duplicates_after_union(sp: Session):
+    """Test drop_duplicates after union operation."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2], "val": ["a", "b"]}))
+    df2 = sp.from_arrow(pa.table({"id": [2, 3], "val": ["b", "c"]}))
+    combined = df1.union(df2)
+    result = combined.drop_duplicates()
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+    assert len(rows) == 3
+    assert rows[0] == {"id": 1, "val": "a"}
+    assert rows[1] == {"id": 2, "val": "b"}
+    assert rows[2] == {"id": 3, "val": "c"}
+
+
+def test_drop_duplicates_partitioned_dataframe(sp: Session):
+    """Test drop_duplicates on a partitioned DataFrame."""
+    # Create data with duplicates across what would be different partitions
+    df = sp.from_items(list(range(100)) + list(range(50)))  # 0-99 + 0-49 again
+    df = df.repartition(10, by_rows=True)
+    result = df.drop_duplicates()
+    rows = sorted(result.take_all(), key=lambda x: x["item"])
+    assert len(rows) == 100
+    assert [r["item"] for r in rows] == list(range(100))
+
+
+def test_drop_duplicates_partitioned_with_subset(sp: Session):
+    """Test drop_duplicates with subset on a partitioned DataFrame."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2, 3, 1, 2, 3, 4, 5],
+        "category": ["A", "A", "A", "B", "B", "B", "A", "A"],
+        "value": [10, 20, 30, 40, 50, 60, 70, 80]
+    }))
+    df = df.repartition(4, by_rows=True)
+    result = df.drop_duplicates(subset="id")
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+    assert len(rows) == 5
+    ids = [r["id"] for r in rows]
+    assert ids == [1, 2, 3, 4, 5]
+
+
+def test_drop_duplicates_invalid_keep_value(sp: Session):
+    """Test that invalid keep value raises ValueError."""
+    df = sp.from_arrow(pa.table({"a": [1, 2, 3]}))
+    with pytest.raises(ValueError) as excinfo:
+        df.drop_duplicates(keep="invalid")
+    assert "Invalid keep value" in str(excinfo.value)
+
+
+def test_drop_duplicates_invalid_subset_column(sp: Session):
+    """Test that invalid subset column raises ValueError."""
+    df = sp.from_arrow(pa.table({"a": [1, 2, 3], "b": [4, 5, 6]}))
+    with pytest.raises(ValueError) as excinfo:
+        df.drop_duplicates(subset="nonexistent")
+    assert "Columns not found" in str(excinfo.value)
+
+
+def test_drop_duplicates_preserves_non_null_requirements(sp: Session):
+    """Test that drop_duplicates preserves non-null column requirements."""
+    df = sp.from_arrow(pa.table({"id": [1, 1, 2], "val": ["a", "b", "c"]}))
+    df_with_requirement = df.require_non_null("id")
+    result = df_with_requirement.drop_duplicates(subset="id")
+    # The non-null requirement should be preserved
+    assert "id" in result._non_null_columns
+
+
+def test_drop_duplicates_keep_first_multiple_groups(sp: Session):
+    """Test keep='first' with multiple duplicate groups."""
+    df = sp.from_arrow(pa.table({
+        "group": ["A", "A", "A", "B", "B", "C"],
+        "order": [1, 2, 3, 1, 2, 1],
+        "value": ["a1", "a2", "a3", "b1", "b2", "c1"]
+    }))
+    result = df.drop_duplicates(subset="group", keep="first")
+    rows = sorted(result.take_all(), key=lambda x: x["group"])
+    assert len(rows) == 3
+    assert rows[0] == {"group": "A", "order": 1, "value": "a1"}
+    assert rows[1] == {"group": "B", "order": 1, "value": "b1"}
+    assert rows[2] == {"group": "C", "order": 1, "value": "c1"}
+
+
+def test_drop_duplicates_keep_last_multiple_groups(sp: Session):
+    """Test keep='last' with multiple duplicate groups."""
+    df = sp.from_arrow(pa.table({
+        "group": ["A", "A", "A", "B", "B", "C"],
+        "order": [1, 2, 3, 1, 2, 1],
+        "value": ["a1", "a2", "a3", "b1", "b2", "c1"]
+    }))
+    result = df.drop_duplicates(subset="group", keep="last")
+    rows = sorted(result.take_all(), key=lambda x: x["group"])
+    assert len(rows) == 3
+    assert rows[0] == {"group": "A", "order": 3, "value": "a3"}
+    assert rows[1] == {"group": "B", "order": 2, "value": "b2"}
+    assert rows[2] == {"group": "C", "order": 1, "value": "c1"}
+
+
+def test_drop_duplicates_with_string_columns(sp: Session):
+    """Test drop_duplicates with string columns."""
+    df = sp.from_arrow(pa.table({
+        "name": ["Alice", "Bob", "Alice", "Carol", "Bob"],
+        "city": ["NYC", "LA", "NYC", "Chicago", "LA"]
+    }))
+    result = df.drop_duplicates()
+    rows = sorted(result.take_all(), key=lambda x: (x["name"], x["city"]))
+    assert len(rows) == 3
+    assert rows[0] == {"name": "Alice", "city": "NYC"}
+    assert rows[1] == {"name": "Bob", "city": "LA"}
+    assert rows[2] == {"name": "Carol", "city": "Chicago"}
+
+
+def test_drop_duplicates_default_keeps_first(sp: Session):
+    """Test that drop_duplicates defaults to keep='first' (pandas compatible)."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 1, 1],
+        "value": [100, 200, 300]
+    }))
+    # Call without specifying keep - should default to 'first'
+    result = df.drop_duplicates(subset="id")
+    rows = result.take_all()
+    assert len(rows) == 1
+    assert rows[0]["id"] == 1
+    # First occurrence (value=100) should be kept, matching pandas behavior
+    assert rows[0]["value"] == 100

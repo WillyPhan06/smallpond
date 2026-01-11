@@ -1836,6 +1836,279 @@ class DataFrame:
         # Use UNION ALL to keep all rows (including duplicates) and preserve partitioning
         return self._build_union(all_dfs)
 
+    def drop_duplicates(
+        self,
+        subset: Union[str, List[str], None] = None,
+        keep: str = "first",
+        npartitions: Optional[int] = None,
+    ) -> "DataFrame":
+        """
+        Remove duplicate rows from the DataFrame.
+
+        This method removes rows that have identical values in the specified columns
+        (or all columns if no subset is specified). When duplicates are found, only
+        one row is kept based on the `keep` parameter.
+
+        For partitioned DataFrames, this method automatically repartitions the data
+        by the subset columns to ensure all potential duplicates are co-located in
+        the same partition before deduplication.
+
+        Parameters
+        ----------
+        subset : str, List[str], or None, optional
+            Column name(s) to consider when identifying duplicates.
+            - If None (default), all columns are used to identify duplicates,
+              meaning rows must have identical values in every column to be
+              considered duplicates.
+            - If a string, that single column is used.
+            - If a list of strings, those columns are used.
+
+        keep : str, default 'first'
+            Determines which duplicate row to keep:
+            - 'first': Keep the first occurrence of each duplicate based on the original
+              row order within each partition. This is the default, matching pandas behavior.
+            - 'last': Keep the last occurrence of each duplicate based on the original
+              row order within each partition.
+            - 'any': Keep any one of the duplicate rows. This is the most efficient option
+              as it uses SQL DISTINCT, but the specific row kept is not guaranteed and
+              may vary between executions. Use this when row order doesn't matter and
+              performance is critical.
+
+        npartitions : int, optional
+            Number of partitions to use for the deduplication operation. If not
+            specified, uses the current number of partitions. This parameter controls
+            the parallelism during deduplication when data needs to be repartitioned
+            to co-locate potential duplicates.
+
+        Returns
+        -------
+        DataFrame
+            A new DataFrame with duplicate rows removed.
+
+        Raises
+        ------
+        ValueError
+            If `keep` is not one of 'first', 'last', or 'any'.
+            If `subset` contains column names that don't exist in the DataFrame
+            (when column names can be determined without computation).
+
+        Examples
+        --------
+        Remove rows that are completely identical across all columns (keeps first occurrence):
+
+        .. code-block::
+
+            # Original: [{'a': 1, 'b': 2}, {'a': 1, 'b': 2}, {'a': 1, 'b': 3}]
+            df_unique = df.drop_duplicates()
+            # Result: [{'a': 1, 'b': 2}, {'a': 1, 'b': 3}]
+            # (first occurrence of duplicate row is kept)
+
+        Remove duplicates based on specific columns (keeps first occurrence):
+
+        .. code-block::
+
+            # Original: [{'id': 1, 'name': 'Alice'}, {'id': 1, 'name': 'Bob'}, {'id': 2, 'name': 'Charlie'}]
+            df_unique = df.drop_duplicates(subset='id')
+            # Result: [{'id': 1, 'name': 'Alice'}, {'id': 2, 'name': 'Charlie'}]
+            # (Alice is kept as she appears first for id=1)
+
+        Keep the last occurrence of duplicates:
+
+        .. code-block::
+
+            df_unique = df.drop_duplicates(subset='id', keep='last')
+
+        Use 'any' for better performance when order doesn't matter:
+
+        .. code-block::
+
+            # When you don't care which duplicate is kept, use 'any' for best performance
+            df_unique = df.drop_duplicates(subset='id', keep='any')
+
+        Drop duplicates after union operation:
+
+        .. code-block::
+
+            # Combine multiple DataFrames and remove any duplicate rows
+            combined = df1.union(df2, df3)
+            unique_combined = combined.drop_duplicates()
+
+        Notes
+        -----
+        - **Pandas compatibility**: The default `keep='first'` matches pandas behavior,
+          making it predictable for users familiar with pandas. Unlike pandas, this
+          implementation also offers `keep='any'` for better performance when row
+          order doesn't matter.
+
+        - **Performance**: Using `keep='any'` is the most efficient option as it uses
+          SQL DISTINCT which is highly optimized. Using `keep='first'` or `keep='last'`
+          requires row numbering which adds overhead. Consider using `keep='any'` for
+          large datasets when the specific row kept doesn't matter.
+
+        - **Partitioned DataFrames**: When dropping duplicates on a subset of columns,
+          the DataFrame is automatically repartitioned by those columns using hash
+          partitioning. This ensures all rows with the same key values are in the
+          same partition, allowing correct deduplication across the distributed data.
+          When dropping duplicates on all columns (`subset=None`), no repartitioning
+          is needed since identical rows will produce the same hash and naturally
+          co-locate.
+
+        - **Row ordering**: The `keep='first'` and `keep='last'` options preserve
+          ordering within each partition but not across partitions. If you need
+          global ordering, consider using `partial_sort()` before dropping duplicates.
+
+        - **Non-null requirements**: Non-null column requirements are preserved
+          through the drop duplicates operation.
+
+        - **Lazy evaluation**: Like other DataFrame operations, drop_duplicates is lazy.
+          The actual deduplication happens when you trigger an action like `count()`,
+          `take()`, `to_pandas()`, etc.
+
+        See Also
+        --------
+        union : Combine multiple DataFrames (may produce duplicates).
+        filter : Filter rows based on conditions.
+        """
+        # Validate 'keep' parameter
+        valid_keep_values = {'any', 'first', 'last'}
+        keep_lower = keep.lower()
+        if keep_lower not in valid_keep_values:
+            raise ValueError(
+                f"Invalid keep value '{keep}'. Supported values are: {', '.join(sorted(valid_keep_values))}"
+            )
+
+        # Normalize subset parameter
+        if subset is None:
+            subset_cols: Optional[List[str]] = None
+        elif isinstance(subset, str):
+            subset_cols = [subset]
+        else:
+            subset_cols = list(subset)
+
+        # Validate subset columns exist (when possible without triggering computation)
+        if subset_cols is not None:
+            available_columns = self._try_get_column_names()
+            if available_columns is not None:
+                missing_cols = set(subset_cols) - set(available_columns)
+                if missing_cols:
+                    raise ValueError(
+                        f"Columns not found in DataFrame: {sorted(missing_cols)}. "
+                        f"Available columns: {available_columns}"
+                    )
+
+        # Determine number of partitions
+        if npartitions is None:
+            npartitions = self.plan.num_partitions
+
+        # For subset-based deduplication with multiple partitions, we need to
+        # repartition to ensure all potential duplicates are in the same partition
+        if subset_cols is not None and npartitions > 1:
+            source_df = self.repartition(npartitions, hash_by=subset_cols)
+        else:
+            source_df = self
+
+        # Get all column names for SQL building
+        all_columns = source_df._try_get_column_names()
+
+        # Build the deduplication SQL using the helper method
+        sql = self._build_drop_duplicates_sql(subset_cols, keep_lower, all_columns)
+
+        plan = SqlEngineNode(
+            self.session._ctx,
+            (source_df.plan,),
+            sql,
+        )
+
+        return DataFrame(
+            self.session,
+            plan,
+            recompute=self.need_recompute,
+            use_cache=self._use_cache,
+            non_null_columns=self._non_null_columns if self._non_null_columns else None
+        )
+
+    @staticmethod
+    def _build_drop_duplicates_sql(
+        subset_cols: Optional[List[str]],
+        keep: str,
+        all_columns: Optional[List[str]],
+    ) -> str:
+        """
+        Build the SQL query for dropping duplicate rows.
+
+        This helper method generates the appropriate SQL based on the deduplication
+        strategy (keep='any', 'first', or 'last') and the columns to consider.
+
+        Parameters
+        ----------
+        subset_cols : List[str] or None
+            Column names to consider when identifying duplicates.
+            If None, all columns are used.
+        keep : str
+            Which duplicate row to keep: 'any', 'first', or 'last'.
+            Must be lowercase.
+        all_columns : List[str] or None
+            All column names in the DataFrame. Used for building the SELECT
+            clause when keep='first' or keep='last'.
+
+        Returns
+        -------
+        str
+            The SQL query string for deduplication.
+        """
+        if keep == 'any':
+            # Use DISTINCT for best performance
+            if subset_cols is None:
+                # Drop duplicates on all columns
+                return "SELECT DISTINCT * FROM {0}"
+            else:
+                # Drop duplicates on subset columns, keep all columns in output
+                # Use DISTINCT ON to get one row per unique subset combination
+                quoted_subset = ", ".join(f'"{col}"' for col in subset_cols)
+                return f"SELECT DISTINCT ON ({quoted_subset}) * FROM {{0}}"
+
+        # Use ROW_NUMBER() for first/last semantics
+        if subset_cols is None:
+            # Partition by all columns
+            if all_columns is not None:
+                partition_cols = ", ".join(f'"{col}"' for col in all_columns)
+            else:
+                # Fallback when column names are not available
+                partition_cols = "*"
+        else:
+            partition_cols = ", ".join(f'"{col}"' for col in subset_cols)
+
+        # For 'first', we want row_num = 1 with ASC ordering (original order)
+        # For 'last', we want row_num = 1 with DESC ordering (reverse order)
+        order_direction = "DESC" if keep == 'last' else "ASC"
+
+        # Build the SQL with ROW_NUMBER() window function
+        # Use rowid as the ordering column to maintain original row order
+        if all_columns is not None:
+            # Select only the original columns (exclude the temporary row number column)
+            quoted_cols = ", ".join(f'"{col}"' for col in all_columns)
+            return f"""
+                SELECT {quoted_cols} FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY {partition_cols}
+                        ORDER BY rowid {order_direction}
+                    ) AS __dedup_row_num__
+                    FROM {{0}}
+                ) WHERE __dedup_row_num__ = 1
+            """
+        else:
+            # Fallback: select all columns including the row number
+            # (will include __dedup_row_num__ in output)
+            return f"""
+                SELECT * FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY {partition_cols}
+                        ORDER BY rowid {order_direction}
+                    ) AS __dedup_row_num__
+                    FROM {{0}}
+                ) WHERE __dedup_row_num__ = 1
+            """
+
     @staticmethod
     def _get_type_category(type_str: str) -> str:
         """
