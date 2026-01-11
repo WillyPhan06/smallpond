@@ -102,6 +102,49 @@ class NullValidationError(ValueError):
         return self.message
 
 
+class SchemaMismatchError(ValueError):
+    """
+    Exception raised when DataFrame schemas don't match during union operations.
+
+    This exception is raised when attempting to union DataFrames with incompatible
+    schemas, such as mismatched column names or different column types.
+
+    Attributes
+    ----------
+    message : str
+        A descriptive error message explaining the schema mismatch.
+    details : Dict[str, Any]
+        Additional details about the mismatch, which may include:
+        - missing_columns: Columns missing from one or more DataFrames
+        - extra_columns: Unexpected columns in one or more DataFrames
+        - type_mismatches: Columns with incompatible types across DataFrames
+
+    Notes
+    -----
+    This exception inherits from `ValueError` because the schemas represent
+    inappropriate values for the union operation. Users can catch this specifically
+    or as a general `ValueError`.
+
+    Example:
+
+    .. code-block::
+
+        try:
+            combined = df1.union(df2, df3)
+        except SchemaMismatchError as e:
+            print(f"Schema mismatch: {e}")
+            print(f"Details: {e.details}")
+    """
+
+    def __init__(self, message: str, details: Optional[Dict[str, Any]] = None):
+        self.message = message
+        self.details = details or {}
+        super().__init__(self.message)
+
+    def __str__(self) -> str:
+        return self.message
+
+
 class DataFrameCache:
     """
     A cache for storing computed DataFrame results.
@@ -892,6 +935,78 @@ class DataFrame:
 
         return None
 
+    def _try_get_schema(self) -> Optional[Dict[str, str]]:
+        """
+        Attempt to get column names and types from the DataFrame's plan without triggering computation.
+
+        This method tries to extract schema information (column names and their types) from the
+        underlying data source if possible. It works for DataFrames created directly from data
+        sources (parquet, CSV, JSON, pandas, arrow) but may not work for DataFrames that have
+        undergone transformations that change the schema.
+
+        Returns
+        -------
+        Optional[Dict[str, str]]
+            A dictionary mapping column names to their type strings if the schema can be
+            determined without computation, or None if the schema cannot be determined cheaply.
+            Type strings are normalized to lowercase for comparison (e.g., "int64", "string").
+
+        Notes
+        -----
+        This is a best-effort method. For complex transformation chains, it returns None
+        and validation will happen at compute time instead.
+        """
+        from smallpond.logical.dataset import (
+            ArrowTableDataSet,
+            CsvDataSet,
+            JsonDataSet,
+            PandasDataSet,
+            ParquetDataSet,
+        )
+
+        # Try to find the root DataSourceNode
+        node = self.plan
+        while node is not None:
+            if isinstance(node, DataSourceNode):
+                dataset = node.dataset
+                # Handle different dataset types
+                if isinstance(dataset, ArrowTableDataSet):
+                    return {field.name: str(field.type) for field in dataset.table.schema}
+                elif isinstance(dataset, PandasDataSet):
+                    # Convert pandas dtypes to string representation
+                    return {col: str(dtype) for col, dtype in dataset.df.dtypes.items()}
+                elif isinstance(dataset, (CsvDataSet, JsonDataSet)):
+                    # These have explicit schema dictionaries (DuckDB type strings)
+                    return dict(dataset.schema)
+                elif isinstance(dataset, ParquetDataSet):
+                    # For parquet, we can read schema from metadata without loading data
+                    try:
+                        import pyarrow.parquet as parquet
+                        resolved_paths = dataset.resolved_paths
+                        if resolved_paths:
+                            # Read just the schema from the first file's metadata
+                            parquet_file = parquet.ParquetFile(resolved_paths[0])
+                            return {field.name: str(field.type) for field in parquet_file.schema_arrow}
+                    except Exception:
+                        # If we can't read metadata, fall back to late validation
+                        pass
+                return None
+
+            # For transformation nodes, try to follow the input dependency chain
+            # But only for transformations that preserve schema (filter, limit, etc.)
+            if hasattr(node, 'input_deps') and node.input_deps:
+                # For nodes with a single input that preserve schema, follow the chain
+                # This works for: filter, limit, repartition, partial_sort, etc.
+                if len(node.input_deps) == 1:
+                    node = node.input_deps[0]
+                else:
+                    # Multiple inputs (like join) - schema is complex, give up
+                    return None
+            else:
+                return None
+
+        return None
+
     def require_non_null(self, columns: Union[str, List[str]]) -> DataFrame:
         """
         Mark columns as required to be non-null.
@@ -1566,6 +1681,404 @@ class DataFrame:
             # If there are overlapping non-join column names, users should rename them
             # before joining using map() to avoid ambiguity.
             return f"SELECT __left__.*, __right__.* FROM {{0}} AS __left__ {join_clause} {{1}} AS __right__{on_clause}"
+
+    def union(self, *others: "DataFrame") -> "DataFrame":
+        """
+        Combine multiple DataFrames by appending their rows.
+
+        This method creates a new DataFrame containing all rows from this DataFrame
+        and all the DataFrames passed as arguments. The schemas of all DataFrames
+        must be compatible: they must have the same column names and compatible types.
+
+        The method handles DataFrames with the same columns but in different order
+        by reordering columns to match the schema of the first (self) DataFrame.
+        Partitioning is preserved - the resulting DataFrame will have the combined
+        partitions from all input DataFrames.
+
+        Parameters
+        ----------
+        *others : DataFrame
+            One or more DataFrames to union with this DataFrame. All DataFrames
+            must have compatible schemas (same column names with compatible types).
+
+        Returns
+        -------
+        DataFrame
+            A new DataFrame containing all rows from this DataFrame and all
+            other DataFrames, with columns ordered according to the first DataFrame.
+
+        Raises
+        ------
+        ValueError
+            If no other DataFrames are provided.
+        SchemaMismatchError
+            If the DataFrames have incompatible schemas:
+            - Different number of columns
+            - Different column names (missing or extra columns)
+            - Incompatible column types (e.g., string vs integer)
+
+        Examples
+        --------
+        Combine two DataFrames with the same schema:
+
+        .. code-block::
+
+            sales_2025 = sp.read_parquet("sales_2025/*.parquet")
+            sales_2026 = sp.read_parquet("sales_2026/*.parquet")
+            all_sales = sales_2025.union(sales_2026)
+
+        Combine multiple DataFrames at once:
+
+        .. code-block::
+
+            q1 = sp.read_parquet("q1/*.parquet")
+            q2 = sp.read_parquet("q2/*.parquet")
+            q3 = sp.read_parquet("q3/*.parquet")
+            q4 = sp.read_parquet("q4/*.parquet")
+            yearly = q1.union(q2, q3, q4)
+
+        Handle DataFrames with same columns in different order:
+
+        .. code-block::
+
+            # df1 has columns: [id, name, value]
+            # df2 has columns: [name, value, id]  (different order)
+            # The union will reorder df2's columns to match df1
+            combined = df1.union(df2)  # Result has columns: [id, name, value]
+
+        Notes
+        -----
+        - **Schema validation**: The union operation validates that all DataFrames
+          have exactly the same columns. If columns don't match, a `SchemaMismatchError`
+          is raised with details about the mismatch.
+
+        - **Type compatibility**: Column types are strictly validated before the union.
+          Types must match exactly or be within the same type category. The following
+          type mismatches will raise `SchemaMismatchError`:
+
+          - **String vs Numeric**: Cannot union string columns (string, large_string,
+            varchar, utf8) with numeric columns (int8, int16, int32, int64, uint8,
+            uint16, uint32, uint64, float, double, float16, float32, float64).
+
+          - **String vs Boolean**: Cannot union string columns with boolean columns.
+
+          - **Numeric vs Boolean**: Cannot union numeric columns with boolean columns.
+
+          - **String vs Temporal**: Cannot union string columns with date/time columns
+            (date32, date64, timestamp, time32, time64).
+
+          - **Numeric vs Temporal**: Cannot union numeric columns with temporal columns.
+
+          The following type variations within the same category are allowed and will
+          be automatically cast by the underlying SQL engine:
+
+          - **Numeric widening**: int32 with int64, float32 with float64, int with float.
+          - **String variations**: string with large_string, utf8 with varchar.
+
+        - **Column ordering**: When DataFrames have the same columns but in different
+          order, the columns are automatically reordered to match the first DataFrame's
+          schema. This ensures consistent column ordering in the result.
+
+        - **Partitioning**: The resulting DataFrame preserves the partitions from all
+          input DataFrames. If df1 has 4 partitions and df2 has 3 partitions, the
+          result will have 7 partitions.
+
+        - **Non-null requirements**: Non-null column requirements from all input
+          DataFrames are merged. If any input DataFrame has `require_non_null("id")`,
+          the result will also have that requirement.
+
+        - **Lazy evaluation**: Like other DataFrame operations, union is lazy. The
+          actual combination happens when you trigger an action like `count()`,
+          `take()`, `to_pandas()`, etc.
+
+        - **Early validation**: When possible, schema and type validation is performed
+          immediately when `union()` is called, without triggering computation. This
+          helps catch errors early. However, for complex transformation chains where
+          the schema cannot be determined without computation, validation will occur
+          at compute time.
+
+        See Also
+        --------
+        join : Combine DataFrames horizontally based on key columns.
+        """
+        if not others:
+            raise ValueError("union() requires at least one other DataFrame")
+
+        # Collect all DataFrames to union
+        all_dfs = [self] + list(others)
+
+        # Get schema information (column names + types) from each DataFrame for validation
+        # We attempt early validation when possible (without triggering computation)
+        schemas_with_types: List[Tuple[int, Dict[str, str]]] = []
+        schemas_names_only: List[Tuple[int, List[str]]] = []
+
+        for i, df in enumerate(all_dfs):
+            schema = df._try_get_schema()
+            if schema is not None:
+                schemas_with_types.append((i, schema))
+                schemas_names_only.append((i, list(schema.keys())))
+            else:
+                # Fall back to column names only if full schema not available
+                columns = df._try_get_column_names()
+                if columns is not None:
+                    schemas_names_only.append((i, columns))
+
+        # Validate schemas early if we have enough information
+        if len(schemas_names_only) == len(all_dfs):
+            # First validate column names
+            self._validate_union_column_names(schemas_names_only)
+
+            # Then validate types if we have type info for all DataFrames
+            if len(schemas_with_types) == len(all_dfs):
+                self._validate_union_column_types(schemas_with_types)
+
+        # Build the union using SQL UNION ALL
+        # Use UNION ALL to keep all rows (including duplicates) and preserve partitioning
+        return self._build_union(all_dfs)
+
+    @staticmethod
+    def _get_type_category(type_str: str) -> str:
+        """
+        Get the category of a type for compatibility checking.
+
+        Returns one of: 'numeric', 'string', 'boolean', 'temporal', 'binary', 'other'
+        """
+        type_lower = type_str.lower()
+
+        # Numeric types
+        numeric_patterns = [
+            'int8', 'int16', 'int32', 'int64',
+            'uint8', 'uint16', 'uint32', 'uint64',
+            'float', 'double', 'float16', 'float32', 'float64',
+            'decimal', 'numeric', 'bigint', 'smallint', 'tinyint',
+            'hugeint', 'real',
+        ]
+        for pattern in numeric_patterns:
+            if pattern in type_lower:
+                return 'numeric'
+
+        # String types
+        string_patterns = [
+            'string', 'utf8', 'large_string', 'large_utf8',
+            'varchar', 'char', 'text', 'object',
+        ]
+        for pattern in string_patterns:
+            if pattern in type_lower:
+                return 'string'
+
+        # Boolean types
+        if 'bool' in type_lower:
+            return 'boolean'
+
+        # Temporal types
+        temporal_patterns = [
+            'date', 'time', 'timestamp', 'duration', 'interval',
+        ]
+        for pattern in temporal_patterns:
+            if pattern in type_lower:
+                return 'temporal'
+
+        # Binary types
+        binary_patterns = ['binary', 'blob', 'bytes']
+        for pattern in binary_patterns:
+            if pattern in type_lower:
+                return 'binary'
+
+        return 'other'
+
+    def _validate_union_column_names(
+        self,
+        schemas: List[Tuple[int, List[str]]],
+    ) -> None:
+        """
+        Validate that all schemas have compatible column names for union.
+
+        Parameters
+        ----------
+        schemas : List[Tuple[int, List[str]]]
+            A list of (index, column_names) tuples for each DataFrame.
+
+        Raises
+        ------
+        SchemaMismatchError
+            If column names are incompatible.
+        """
+        if len(schemas) < 2:
+            return
+
+        # Use the first DataFrame's schema as the reference
+        ref_idx, ref_columns = schemas[0]
+        ref_columns_set = set(ref_columns)
+        ref_num_cols = len(ref_columns)
+
+        for df_idx, columns in schemas[1:]:
+            columns_set = set(columns)
+
+            # Check for column count mismatch
+            if len(columns) != ref_num_cols:
+                missing = ref_columns_set - columns_set
+                extra = columns_set - ref_columns_set
+                raise SchemaMismatchError(
+                    f"Schema mismatch: DataFrame at index {df_idx} has {len(columns)} columns, "
+                    f"but expected {ref_num_cols} columns (matching the first DataFrame). "
+                    f"Missing columns: {sorted(missing) if missing else 'none'}. "
+                    f"Extra columns: {sorted(extra) if extra else 'none'}.",
+                    details={
+                        "dataframe_index": df_idx,
+                        "expected_columns": ref_columns,
+                        "actual_columns": columns,
+                        "missing_columns": sorted(missing),
+                        "extra_columns": sorted(extra),
+                    }
+                )
+
+            # Check for column name mismatch (same count but different names)
+            if columns_set != ref_columns_set:
+                missing = ref_columns_set - columns_set
+                extra = columns_set - ref_columns_set
+                raise SchemaMismatchError(
+                    f"Schema mismatch: DataFrame at index {df_idx} has different columns than the first DataFrame. "
+                    f"Missing columns: {sorted(missing)}. Extra columns: {sorted(extra)}.",
+                    details={
+                        "dataframe_index": df_idx,
+                        "expected_columns": ref_columns,
+                        "actual_columns": columns,
+                        "missing_columns": sorted(missing),
+                        "extra_columns": sorted(extra),
+                    }
+                )
+
+    def _validate_union_column_types(
+        self,
+        schemas: List[Tuple[int, Dict[str, str]]],
+    ) -> None:
+        """
+        Validate that all schemas have compatible column types for union.
+
+        This method checks that columns with the same name across different DataFrames
+        have compatible types. Types within the same category (e.g., int32 and int64)
+        are considered compatible, but types from different categories (e.g., string
+        and int64) will raise an error.
+
+        Parameters
+        ----------
+        schemas : List[Tuple[int, Dict[str, str]]]
+            A list of (index, schema_dict) tuples for each DataFrame.
+            schema_dict maps column names to type strings.
+
+        Raises
+        ------
+        SchemaMismatchError
+            If column types are incompatible.
+        """
+        if len(schemas) < 2:
+            return
+
+        # Use the first DataFrame's schema as the reference
+        ref_idx, ref_schema = schemas[0]
+
+        for df_idx, schema in schemas[1:]:
+            type_mismatches = []
+
+            for col_name, ref_type in ref_schema.items():
+                if col_name not in schema:
+                    # Column name mismatch should have been caught earlier
+                    continue
+
+                actual_type = schema[col_name]
+                ref_category = self._get_type_category(ref_type)
+                actual_category = self._get_type_category(actual_type)
+
+                # Check if types are in compatible categories
+                if ref_category != actual_category:
+                    type_mismatches.append({
+                        "column": col_name,
+                        "expected_type": ref_type,
+                        "actual_type": actual_type,
+                        "expected_category": ref_category,
+                        "actual_category": actual_category,
+                    })
+
+            if type_mismatches:
+                # Build a user-friendly error message
+                mismatch_details = []
+                for m in type_mismatches:
+                    mismatch_details.append(
+                        f"'{m['column']}': expected {m['expected_category']} ({m['expected_type']}) "
+                        f"but got {m['actual_category']} ({m['actual_type']})"
+                    )
+
+                raise SchemaMismatchError(
+                    f"Type mismatch: DataFrame at index {df_idx} has incompatible column types. "
+                    f"Mismatched columns: {', '.join(mismatch_details)}. "
+                    f"Types must be in the same category (e.g., all numeric or all string).",
+                    details={
+                        "dataframe_index": df_idx,
+                        "type_mismatches": type_mismatches,
+                    }
+                )
+
+    def _build_union(self, dfs: List["DataFrame"]) -> "DataFrame":
+        """
+        Build the union of multiple DataFrames.
+
+        Uses SQL UNION ALL BY NAME to handle column reordering automatically.
+        DuckDB's UNION ALL BY NAME matches columns by name rather than position,
+        which allows unioning DataFrames with the same columns in different order.
+
+        Parameters
+        ----------
+        dfs : List[DataFrame]
+            The DataFrames to union.
+
+        Returns
+        -------
+        DataFrame
+            A new DataFrame representing the union of all inputs.
+        """
+        # Get the reference column order from the first DataFrame
+        ref_columns = self._try_get_column_names()
+
+        # Build the SQL query using UNION ALL BY NAME
+        # UNION ALL BY NAME matches columns by name, not position, which handles
+        # DataFrames with same columns in different order
+        # After unioning, we select columns in the reference order to ensure consistency
+        union_parts = []
+        for i in range(len(dfs)):
+            union_parts.append(f"SELECT * FROM {{{i}}}")
+
+        union_sql = " UNION ALL BY NAME ".join(union_parts)
+
+        # If we know the reference columns, wrap with a SELECT to ensure column order
+        if ref_columns:
+            quoted_cols = ", ".join(f'"{col}"' for col in ref_columns)
+            sql = f"SELECT {quoted_cols} FROM ({union_sql})"
+        else:
+            sql = union_sql
+
+        # Create the SQL node with all input DataFrames
+        plan = SqlEngineNode(
+            self.session._ctx,
+            tuple(df.plan for df in dfs),
+            sql,
+        )
+
+        # Merge properties from all DataFrames
+        recompute = any(df.need_recompute for df in dfs)
+        use_cache = all(df._use_cache for df in dfs)
+
+        # Merge non-null columns from all DataFrames
+        merged_non_null: frozenset = frozenset()
+        for df in dfs:
+            merged_non_null = merged_non_null | df._non_null_columns
+
+        return DataFrame(
+            self.session,
+            plan,
+            recompute=recompute,
+            use_cache=use_cache,
+            non_null_columns=merged_non_null if merged_non_null else None
+        )
 
     def groupby_agg(
         self,

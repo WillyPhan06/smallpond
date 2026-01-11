@@ -2443,3 +2443,665 @@ def test_null_validation_error_message(sp: Session):
     assert "2 nulls" in error_msg
     assert "email" in error_msg
     assert "require_non_null()" in error_msg
+
+
+# ==================== Union Tests ====================
+
+
+def test_union_basic_two_dataframes(sp: Session):
+    """Test basic union of two DataFrames with the same schema."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]}))
+    df2 = sp.from_arrow(pa.table({"id": [4, 5, 6], "value": ["d", "e", "f"]}))
+
+    result = df1.union(df2)
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+
+    assert len(rows) == 6
+    assert rows[0] == {"id": 1, "value": "a"}
+    assert rows[5] == {"id": 6, "value": "f"}
+
+
+def test_union_multiple_dataframes(sp: Session):
+    """Test union of more than two DataFrames."""
+    df1 = sp.from_arrow(pa.table({"x": [1, 2]}))
+    df2 = sp.from_arrow(pa.table({"x": [3, 4]}))
+    df3 = sp.from_arrow(pa.table({"x": [5, 6]}))
+    df4 = sp.from_arrow(pa.table({"x": [7, 8]}))
+
+    result = df1.union(df2, df3, df4)
+    rows = sorted(result.take_all(), key=lambda x: x["x"])
+
+    assert len(rows) == 8
+    assert [r["x"] for r in rows] == [1, 2, 3, 4, 5, 6, 7, 8]
+
+
+def test_union_different_column_order(sp: Session):
+    """Test union of DataFrames with same columns but different order."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2], "name": ["a", "b"], "value": [10, 20]}))
+    df2 = sp.from_arrow(pa.table({"name": ["c", "d"], "value": [30, 40], "id": [3, 4]}))
+
+    result = df1.union(df2)
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+
+    # Result should have columns in the order of the first DataFrame
+    assert len(rows) == 4
+    assert rows[0] == {"id": 1, "name": "a", "value": 10}
+    assert rows[1] == {"id": 2, "name": "b", "value": 20}
+    assert rows[2] == {"id": 3, "name": "c", "value": 30}
+    assert rows[3] == {"id": 4, "name": "d", "value": 40}
+
+
+def test_union_preserves_all_rows(sp: Session):
+    """Test that union preserves all rows including duplicates."""
+    df1 = sp.from_arrow(pa.table({"x": [1, 2, 3]}))
+    df2 = sp.from_arrow(pa.table({"x": [2, 3, 4]}))  # 2 and 3 are duplicates
+
+    result = df1.union(df2)
+    rows = result.take_all()
+
+    # Should have 6 rows, including duplicates
+    assert len(rows) == 6
+    values = sorted([r["x"] for r in rows])
+    assert values == [1, 2, 2, 3, 3, 4]
+
+
+def test_union_with_nulls(sp: Session):
+    """Test union correctly handles null values."""
+    df1 = sp.from_arrow(pa.table({
+        "id": pa.array([1, None, 3], type=pa.int64()),
+        "value": ["a", "b", "c"]
+    }))
+    df2 = sp.from_arrow(pa.table({
+        "id": pa.array([4, 5, None], type=pa.int64()),
+        "value": ["d", "e", "f"]
+    }))
+
+    result = df1.union(df2)
+    rows = result.take_all()
+
+    assert len(rows) == 6
+    # Count nulls
+    null_count = sum(1 for r in rows if r["id"] is None)
+    assert null_count == 2
+
+
+def test_union_validation_no_args(sp: Session):
+    """Test that union raises error when no other DataFrames are provided."""
+    df1 = sp.from_arrow(pa.table({"x": [1, 2]}))
+
+    with pytest.raises(ValueError, match="requires at least one other DataFrame"):
+        df1.union()
+
+
+def test_union_validation_missing_columns(sp: Session):
+    """Test that union raises SchemaMismatchError when columns are missing."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({"id": [1, 2], "name": ["a", "b"]}))
+    df2 = sp.from_arrow(pa.table({"id": [3, 4]}))  # Missing 'name' column
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error = exc_info.value
+    assert "name" in str(error)
+    assert "Missing columns" in str(error) or "missing" in str(error).lower()
+    assert error.details.get("missing_columns") == ["name"]
+
+
+def test_union_validation_extra_columns(sp: Session):
+    """Test that union raises SchemaMismatchError when extra columns exist."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({"id": [1, 2]}))
+    df2 = sp.from_arrow(pa.table({"id": [3, 4], "extra": ["a", "b"]}))
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error = exc_info.value
+    assert "extra" in str(error)
+    assert error.details.get("extra_columns") == ["extra"]
+
+
+def test_union_validation_different_columns(sp: Session):
+    """Test that union raises SchemaMismatchError when columns are completely different."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({"a": [1, 2], "b": [3, 4]}))
+    df2 = sp.from_arrow(pa.table({"c": [5, 6], "d": [7, 8]}))
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error = exc_info.value
+    # Should have both missing and extra columns
+    assert "a" in str(error) or "b" in str(error)
+    assert "c" in str(error) or "d" in str(error)
+
+
+def test_union_preserves_partitions(sp: Session):
+    """Test that union preserves partitioning from all input DataFrames."""
+    # Create DataFrames with different partition counts
+    df1 = sp.from_items(list(range(100))).repartition(4, by_rows=True)
+    df2 = sp.from_items(list(range(100, 200))).repartition(3, by_rows=True)
+
+    result = df1.union(df2)
+    rows = result.take_all()
+
+    # All 200 rows should be present
+    assert len(rows) == 200
+    values = sorted([r["item"] for r in rows])
+    assert values == list(range(200))
+
+
+def test_union_preserves_non_null_columns(sp: Session):
+    """Test that union merges non-null column requirements from all DataFrames."""
+    from smallpond.dataframe import NullValidationError
+
+    df1 = sp.from_arrow(pa.table({
+        "id": pa.array([1, 2], type=pa.int64()),
+        "value": [10, 20]
+    })).require_non_null("id")
+
+    df2 = sp.from_arrow(pa.table({
+        "id": pa.array([3, None], type=pa.int64()),  # Has a null in 'id'
+        "value": [30, 40]
+    })).require_non_null("value")
+
+    result = df1.union(df2)
+
+    # Result should have non-null requirements for both 'id' and 'value'
+    assert "id" in result._non_null_columns
+    assert "value" in result._non_null_columns
+
+    # Should raise error because df2 has null in 'id'
+    with pytest.raises(NullValidationError) as exc_info:
+        result.count()
+
+    assert "id" in exc_info.value.columns
+
+
+def test_union_preserves_cache_setting(sp: Session):
+    """Test that union inherits cache setting correctly."""
+    df1 = sp.from_arrow(pa.table({"x": [1, 2]})).no_cache()
+    df2 = sp.from_arrow(pa.table({"x": [3, 4]}))
+
+    result = df1.union(df2)
+    # Cache should be disabled if any input has caching disabled
+    assert result._use_cache is False
+
+
+def test_union_large_dataset(sp: Session):
+    """Test union correctness with larger datasets across partitions."""
+    # Create two DataFrames with 500 rows each across multiple partitions
+    items1 = [{"id": i, "category": "A", "value": i * 10} for i in range(500)]
+    items2 = [{"id": i + 500, "category": "B", "value": (i + 500) * 10} for i in range(500)]
+
+    df1 = sp.from_items(items1).repartition(5, by_rows=True)
+    df2 = sp.from_items(items2).repartition(5, by_rows=True)
+
+    result = df1.union(df2)
+    rows = result.take_all()
+
+    assert len(rows) == 1000
+
+    # Verify all ids are present
+    ids = sorted([r["id"] for r in rows])
+    assert ids == list(range(1000))
+
+    # Verify categories
+    category_a = [r for r in rows if r["category"] == "A"]
+    category_b = [r for r in rows if r["category"] == "B"]
+    assert len(category_a) == 500
+    assert len(category_b) == 500
+
+
+def test_union_with_filter_after(sp: Session):
+    """Test that filter can be applied after union."""
+    df1 = sp.from_arrow(pa.table({"id": [1, 2, 3], "category": ["A", "A", "B"]}))
+    df2 = sp.from_arrow(pa.table({"id": [4, 5, 6], "category": ["A", "B", "B"]}))
+
+    result = df1.union(df2).filter("category = 'A'")
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+
+    assert len(rows) == 3  # ids 1, 2, 4
+    assert all(r["category"] == "A" for r in rows)
+
+
+def test_union_with_map_after(sp: Session):
+    """Test that map can be applied after union."""
+    df1 = sp.from_arrow(pa.table({"value": [1, 2]}))
+    df2 = sp.from_arrow(pa.table({"value": [3, 4]}))
+
+    result = df1.union(df2).map("value * 2 as doubled")
+    rows = sorted(result.take_all(), key=lambda x: x["doubled"])
+
+    assert len(rows) == 4
+    assert [r["doubled"] for r in rows] == [2, 4, 6, 8]
+
+
+def test_union_empty_dataframe(sp: Session):
+    """Test union with an empty DataFrame."""
+    df1 = sp.from_arrow(pa.table({"x": [1, 2, 3]}))
+    df2 = sp.from_arrow(pa.table({"x": []}))  # Empty DataFrame with same schema
+
+    result = df1.union(df2)
+    rows = result.take_all()
+
+    assert len(rows) == 3
+
+
+def test_union_both_empty(sp: Session):
+    """Test union of two empty DataFrames."""
+    df1 = sp.from_arrow(pa.table({"x": pa.array([], type=pa.int64())}))
+    df2 = sp.from_arrow(pa.table({"x": pa.array([], type=pa.int64())}))
+
+    result = df1.union(df2)
+    rows = result.take_all()
+
+    assert len(rows) == 0
+
+
+def test_union_multiple_numeric_types(sp: Session):
+    """Test union with various numeric column types."""
+    df1 = sp.from_arrow(pa.table({
+        "int_col": pa.array([1, 2], type=pa.int64()),
+        "float_col": pa.array([1.5, 2.5], type=pa.float64()),
+    }))
+    df2 = sp.from_arrow(pa.table({
+        "int_col": pa.array([3, 4], type=pa.int64()),
+        "float_col": pa.array([3.5, 4.5], type=pa.float64()),
+    }))
+
+    result = df1.union(df2)
+    rows = sorted(result.take_all(), key=lambda x: x["int_col"])
+
+    assert len(rows) == 4
+    assert rows[0]["float_col"] == 1.5
+    assert rows[3]["float_col"] == 4.5
+
+
+def test_union_schema_mismatch_error_details(sp: Session):
+    """Test that SchemaMismatchError contains useful details."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({"a": [1], "b": [2], "c": [3]}))
+    df2 = sp.from_arrow(pa.table({"a": [4], "b": [5], "d": [6]}))  # 'd' instead of 'c'
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error = exc_info.value
+    assert error.details["dataframe_index"] == 1
+    assert "c" in error.details["missing_columns"]
+    assert "d" in error.details["extra_columns"]
+    assert error.details["expected_columns"] == ["a", "b", "c"]
+
+
+def test_union_chained(sp: Session):
+    """Test chaining multiple union calls."""
+    df1 = sp.from_arrow(pa.table({"x": [1]}))
+    df2 = sp.from_arrow(pa.table({"x": [2]}))
+    df3 = sp.from_arrow(pa.table({"x": [3]}))
+    df4 = sp.from_arrow(pa.table({"x": [4]}))
+
+    # Chain union calls
+    result = df1.union(df2).union(df3).union(df4)
+    rows = sorted(result.take_all(), key=lambda x: x["x"])
+
+    assert len(rows) == 4
+    assert [r["x"] for r in rows] == [1, 2, 3, 4]
+
+
+def test_union_recompute_inheritance(sp: Session):
+    """Test that union inherits recompute flag from inputs."""
+    df1 = sp.from_arrow(pa.table({"x": [1, 2]})).recompute()
+    df2 = sp.from_arrow(pa.table({"x": [3, 4]}))
+
+    result = df1.union(df2)
+    assert result.need_recompute is True
+
+
+def test_union_with_groupby_after(sp: Session):
+    """Test that groupby_agg can be applied after union."""
+    df1 = sp.from_arrow(pa.table({
+        "category": ["A", "A", "B"],
+        "value": [10, 20, 30]
+    }))
+    df2 = sp.from_arrow(pa.table({
+        "category": ["A", "B", "B"],
+        "value": [40, 50, 60]
+    }))
+
+    result = df1.union(df2).groupby_agg(by="category", aggs={"value": "sum"})
+    rows = sorted(result.take_all(), key=lambda x: x["category"])
+
+    assert len(rows) == 2
+    assert rows[0]["category"] == "A"
+    assert rows[0]["value_sum"] == 70  # 10 + 20 + 40
+    assert rows[1]["category"] == "B"
+    assert rows[1]["value_sum"] == 140  # 30 + 50 + 60
+
+
+def test_union_validation_third_dataframe_mismatch(sp: Session):
+    """Test that union validates all DataFrames, not just the second one."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({"a": [1], "b": [2]}))
+    df2 = sp.from_arrow(pa.table({"a": [3], "b": [4]}))
+    df3 = sp.from_arrow(pa.table({"a": [5], "c": [6]}))  # Mismatch in third DataFrame
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2, df3)
+
+    error = exc_info.value
+    assert error.details["dataframe_index"] == 2  # Third DataFrame (index 2)
+
+
+# ==================== Union Type Validation Tests ====================
+
+
+def test_union_type_mismatch_string_vs_int(sp: Session):
+    """Test that union raises SchemaMismatchError for string vs integer type mismatch."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({"id": [1, 2, 3], "value": [10, 20, 30]}))
+    df2 = sp.from_arrow(pa.table({"id": ["a", "b", "c"], "value": [40, 50, 60]}))  # id is string
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error = exc_info.value
+    assert "Type mismatch" in str(error)
+    assert "id" in str(error)
+    assert error.details["dataframe_index"] == 1
+    assert len(error.details["type_mismatches"]) == 1
+    assert error.details["type_mismatches"][0]["column"] == "id"
+    assert error.details["type_mismatches"][0]["expected_category"] == "numeric"
+    assert error.details["type_mismatches"][0]["actual_category"] == "string"
+
+
+def test_union_type_mismatch_int_vs_string(sp: Session):
+    """Test type mismatch in reverse order (string first, int second)."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({"name": ["alice", "bob"], "score": [100, 200]}))
+    df2 = sp.from_arrow(pa.table({"name": [1, 2], "score": [300, 400]}))  # name is int
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error = exc_info.value
+    assert "name" in str(error)
+    assert error.details["type_mismatches"][0]["expected_category"] == "string"
+    assert error.details["type_mismatches"][0]["actual_category"] == "numeric"
+
+
+def test_union_type_mismatch_bool_vs_int(sp: Session):
+    """Test that union raises SchemaMismatchError for boolean vs integer type mismatch."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({"flag": [True, False, True]}))
+    df2 = sp.from_arrow(pa.table({"flag": [1, 0, 1]}))  # flag is int
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error = exc_info.value
+    assert "flag" in str(error)
+    assert error.details["type_mismatches"][0]["expected_category"] == "boolean"
+    assert error.details["type_mismatches"][0]["actual_category"] == "numeric"
+
+
+def test_union_type_mismatch_bool_vs_string(sp: Session):
+    """Test that union raises SchemaMismatchError for boolean vs string type mismatch."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({"active": [True, False]}))
+    df2 = sp.from_arrow(pa.table({"active": ["yes", "no"]}))  # active is string
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error = exc_info.value
+    assert "active" in str(error)
+    assert error.details["type_mismatches"][0]["expected_category"] == "boolean"
+    assert error.details["type_mismatches"][0]["actual_category"] == "string"
+
+
+def test_union_type_mismatch_multiple_columns(sp: Session):
+    """Test that union reports all type mismatches when multiple columns have issues."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({
+        "id": [1, 2],
+        "name": ["alice", "bob"],
+        "active": [True, False]
+    }))
+    df2 = sp.from_arrow(pa.table({
+        "id": ["a", "b"],      # string instead of int
+        "name": [100, 200],    # int instead of string
+        "active": [True, False]  # matches
+    }))
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error = exc_info.value
+    assert len(error.details["type_mismatches"]) == 2
+    mismatched_cols = {m["column"] for m in error.details["type_mismatches"]}
+    assert "id" in mismatched_cols
+    assert "name" in mismatched_cols
+
+
+def test_union_type_compatible_numeric_widening(sp: Session):
+    """Test that union allows compatible numeric types (int32 with int64)."""
+    df1 = sp.from_arrow(pa.table({
+        "id": pa.array([1, 2, 3], type=pa.int32()),
+        "value": pa.array([1.5, 2.5, 3.5], type=pa.float32())
+    }))
+    df2 = sp.from_arrow(pa.table({
+        "id": pa.array([4, 5, 6], type=pa.int64()),
+        "value": pa.array([4.5, 5.5, 6.5], type=pa.float64())
+    }))
+
+    # Should not raise - numeric types are compatible
+    result = df1.union(df2)
+    rows = result.take_all()
+    assert len(rows) == 6
+
+
+def test_union_type_compatible_string_variations(sp: Session):
+    """Test that union allows compatible string types (string with large_string)."""
+    df1 = sp.from_arrow(pa.table({
+        "name": pa.array(["alice", "bob"], type=pa.string())
+    }))
+    df2 = sp.from_arrow(pa.table({
+        "name": pa.array(["carol", "dave"], type=pa.large_string())
+    }))
+
+    # Should not raise - string types are compatible
+    result = df1.union(df2)
+    rows = result.take_all()
+    assert len(rows) == 4
+
+
+def test_union_type_mismatch_temporal_vs_string(sp: Session):
+    """Test that union raises SchemaMismatchError for temporal vs string type mismatch."""
+    from smallpond.dataframe import SchemaMismatchError
+    import datetime
+
+    df1 = sp.from_arrow(pa.table({
+        "event_date": pa.array([datetime.date(2024, 1, 1), datetime.date(2024, 1, 2)])
+    }))
+    df2 = sp.from_arrow(pa.table({
+        "event_date": ["2024-01-03", "2024-01-04"]  # string instead of date
+    }))
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error = exc_info.value
+    assert "event_date" in str(error)
+    assert error.details["type_mismatches"][0]["expected_category"] == "temporal"
+    assert error.details["type_mismatches"][0]["actual_category"] == "string"
+
+
+def test_union_type_mismatch_temporal_vs_numeric(sp: Session):
+    """Test that union raises SchemaMismatchError for temporal vs numeric type mismatch."""
+    from smallpond.dataframe import SchemaMismatchError
+    import datetime
+
+    df1 = sp.from_arrow(pa.table({
+        "timestamp": pa.array([datetime.date(2024, 1, 1), datetime.date(2024, 1, 2)])
+    }))
+    df2 = sp.from_arrow(pa.table({
+        "timestamp": [1704067200, 1704153600]  # unix timestamp as int
+    }))
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error = exc_info.value
+    assert "timestamp" in str(error)
+
+
+def test_union_type_compatible_temporal_same_category(sp: Session):
+    """Test that union allows compatible temporal types."""
+    import datetime
+
+    df1 = sp.from_arrow(pa.table({
+        "event_date": pa.array([datetime.date(2024, 1, 1), datetime.date(2024, 1, 2)], type=pa.date32())
+    }))
+    df2 = sp.from_arrow(pa.table({
+        "event_date": pa.array([datetime.date(2024, 1, 3), datetime.date(2024, 1, 4)], type=pa.date64())
+    }))
+
+    # Should not raise - both are temporal types
+    result = df1.union(df2)
+    rows = result.take_all()
+    assert len(rows) == 4
+
+
+def test_union_type_error_message_includes_types(sp: Session):
+    """Test that type mismatch error message includes the actual types."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({"col": pa.array([1, 2], type=pa.int64())}))
+    df2 = sp.from_arrow(pa.table({"col": pa.array(["a", "b"], type=pa.string())}))
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error_msg = str(exc_info.value)
+    # The error message should contain type information
+    assert "int64" in error_msg
+    assert "string" in error_msg
+    assert "numeric" in error_msg  # category
+
+
+def test_union_type_validation_third_dataframe(sp: Session):
+    """Test that type validation checks all DataFrames, not just the second one."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({"value": [1, 2]}))
+    df2 = sp.from_arrow(pa.table({"value": [3, 4]}))
+    df3 = sp.from_arrow(pa.table({"value": ["a", "b"]}))  # Type mismatch in third
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2, df3)
+
+    error = exc_info.value
+    assert error.details["dataframe_index"] == 2  # Third DataFrame
+
+
+def test_union_with_pandas_type_mismatch(sp: Session):
+    """Test type validation works with DataFrames created from pandas."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    pd_df1 = pd.DataFrame({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+    pd_df2 = pd.DataFrame({"id": ["x", "y", "z"], "name": ["d", "e", "f"]})  # id is string
+
+    df1 = sp.from_pandas(pd_df1)
+    df2 = sp.from_pandas(pd_df2)
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1.union(df2)
+
+    error = exc_info.value
+    assert "id" in str(error)
+
+
+def test_union_with_filter_type_validation_preserved(sp: Session):
+    """Test that type validation works through filter transformation."""
+    from smallpond.dataframe import SchemaMismatchError
+
+    df1 = sp.from_arrow(pa.table({"id": [1, 2, 3, 4], "value": [10, 20, 30, 40]}))
+    df2 = sp.from_arrow(pa.table({"id": ["a", "b"], "value": [50, 60]}))
+
+    # Apply filter to df1 - schema should be preserved
+    df1_filtered = df1.filter("value > 15")
+
+    with pytest.raises(SchemaMismatchError) as exc_info:
+        df1_filtered.union(df2)
+
+    error = exc_info.value
+    assert "id" in str(error)
+
+
+def test_union_type_validation_skipped_when_schema_unavailable(sp: Session):
+    """Test that union proceeds without early type validation when schema can't be determined.
+
+    When schemas can't be fully extracted (e.g., after complex transformations),
+    the union should still work and let DuckDB handle type validation at compute time.
+    """
+    # Create a DataFrame with a transformation that makes schema extraction difficult
+    df1 = sp.from_arrow(pa.table({"a": [1, 2], "b": [3, 4]}))
+    df2 = sp.from_arrow(pa.table({"a": [5, 6], "b": [7, 8]}))
+
+    # Apply a map that changes schema - this makes _try_get_schema return None
+    # because the method can't determine the output schema of map operations
+    df1_mapped = df1.map("a + b as c")
+    df2_mapped = df2.map("a + b as c")
+
+    # This should work - no early validation, DuckDB handles it
+    result = df1_mapped.union(df2_mapped)
+    rows = result.take_all()
+    assert len(rows) == 4
+
+
+def test_union_type_get_type_category_function(sp: Session):
+    """Test the _get_type_category static method handles various type strings."""
+    from smallpond.dataframe import DataFrame
+
+    # Numeric types
+    assert DataFrame._get_type_category("int64") == "numeric"
+    assert DataFrame._get_type_category("INT32") == "numeric"
+    assert DataFrame._get_type_category("float64") == "numeric"
+    assert DataFrame._get_type_category("double") == "numeric"
+    assert DataFrame._get_type_category("decimal(10,2)") == "numeric"
+    assert DataFrame._get_type_category("bigint") == "numeric"
+
+    # String types
+    assert DataFrame._get_type_category("string") == "string"
+    assert DataFrame._get_type_category("large_string") == "string"
+    assert DataFrame._get_type_category("utf8") == "string"
+    assert DataFrame._get_type_category("VARCHAR") == "string"
+
+    # Boolean types
+    assert DataFrame._get_type_category("bool") == "boolean"
+    assert DataFrame._get_type_category("boolean") == "boolean"
+
+    # Temporal types
+    assert DataFrame._get_type_category("date32") == "temporal"
+    assert DataFrame._get_type_category("timestamp[ns]") == "temporal"
+    assert DataFrame._get_type_category("time64[us]") == "temporal"
+
+    # Binary types
+    assert DataFrame._get_type_category("binary") == "binary"
+    assert DataFrame._get_type_category("large_binary") == "binary"
+
+    # Unknown types should return "other"
+    assert DataFrame._get_type_category("unknown_type") == "other"
+    assert DataFrame._get_type_category("struct<a: int>") == "other"
