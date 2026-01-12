@@ -6,6 +6,7 @@ import pickle
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -23,6 +24,81 @@ from smallpond.logical.node import *
 from smallpond.logical.optimizer import Optimizer
 from smallpond.logical.planner import Planner
 from smallpond.session import SessionBase
+
+
+@dataclass(frozen=True)
+class OperationRecord:
+    """
+    An immutable record of a dataset-level operation performed on a DataFrame.
+
+    This class stores information about operations that affect the DataFrame
+    at a dataset level (e.g., filter, join, union) for debugging and auditing
+    purposes. It allows users to trace the sequence of transformations that
+    led to the current state of a DataFrame.
+
+    The class is immutable (frozen=True) to ensure that once an operation is
+    recorded, it cannot be modified. This guarantees the integrity of the
+    operation history.
+
+    Attributes
+    ----------
+    operation : str
+        The name of the operation (e.g., 'filter', 'join', 'union').
+    params : tuple
+        A tuple of (key, value) pairs representing the parameters passed to
+        the operation. Stored as a tuple instead of dict for immutability.
+        For readability, callable parameters are represented as '<function>'
+        and DataFrame parameters are represented as '<DataFrame>'.
+    timestamp : datetime
+        The timestamp when the operation was recorded.
+
+    Examples
+    --------
+    .. code-block::
+
+        # Get the history of operations on a DataFrame
+        for record in df.history():
+            print(f"{record.timestamp}: {record.operation}({record.params})")
+
+        # Access parameters as a dictionary
+        params_dict = dict(record.params)
+
+    Notes
+    -----
+    - Only dataset-level operations are tracked (filter, join, union, etc.).
+    - Row-level operations are not tracked as they would require significant
+      code changes and memory overhead.
+    - The operation history is inherited when creating new DataFrames from
+      transformations, maintaining the full lineage of operations.
+    - This class is immutable - attempting to modify any attribute after
+      creation will raise a ``FrozenInstanceError``.
+    """
+    operation: str
+    params: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
+    timestamp: datetime = field(default_factory=datetime.now)
+
+    def __repr__(self) -> str:
+        params_str = ", ".join(f"{k}={v!r}" for k, v in self.params)
+        return f"OperationRecord({self.operation}({params_str}) at {self.timestamp.isoformat()})"
+
+    def get_params(self) -> Dict[str, Any]:
+        """
+        Get the operation parameters as a dictionary.
+
+        Returns
+        -------
+        Dict[str, Any]
+            A dictionary of parameter names to values.
+
+        Examples
+        --------
+        .. code-block::
+
+            record = df.history()[0]
+            params = record.get_params()
+            print(params.get('predicate'))
+        """
+        return dict(self.params)
 
 
 class NullValidationError(ValueError):
@@ -414,7 +490,30 @@ def set_default_cache(cache: Optional[DataFrameCache]) -> None:
 
 
 class Session(SessionBase):
-    # Extended session class with additional methods to create DataFrames.
+    """
+    Extended session class with methods to create DataFrames.
+
+    The Session class is the main entry point for creating DataFrames in smallpond.
+    It provides methods to read data from various sources (Parquet, CSV, JSON, pandas,
+    PyArrow) and execute SQL queries.
+
+    Operation History Tracking
+    --------------------------
+    When a DataFrame is created through Session methods (e.g., ``read_parquet()``,
+    ``from_pandas()``), operation history tracking begins automatically. The first
+    operation recorded is the data source operation itself.
+
+    For example:
+    - ``sp.read_parquet("data/*.parquet")`` creates a DataFrame with history
+      starting at ``read_parquet``
+    - ``sp.from_pandas(df)`` creates a DataFrame with history starting at ``from_pandas``
+    - ``sp.partial_sql(query, df1, df2)`` inherits history from the first input
+      DataFrame and adds ``partial_sql``
+
+    The history continues to build as transformations are applied to the DataFrame.
+    See ``DataFrame.history()`` for more details on accessing and understanding
+    the operation history.
+    """
 
     def __init__(self, cache: Optional[DataFrameCache] = None, **kwargs):
         """
@@ -498,7 +597,12 @@ class Session(SessionBase):
         """
         dataset = CsvDataSet(paths, OrderedDict(schema), delim)
         plan = DataSourceNode(self._ctx, dataset)
-        return DataFrame(self, plan)
+        # Record operation history for data source
+        history = [OperationRecord(
+            operation="read_csv",
+            params=(("paths", paths), ("schema", schema), ("delim", delim))
+        )]
+        return DataFrame(self, plan, operation_history=history)
 
     def read_parquet(
         self,
@@ -512,7 +616,12 @@ class Session(SessionBase):
         """
         dataset = ParquetDataSet(paths, columns=columns, union_by_name=union_by_name, recursive=recursive)
         plan = DataSourceNode(self._ctx, dataset)
-        return DataFrame(self, plan)
+        # Record operation history for data source
+        history = [OperationRecord(
+            operation="read_parquet",
+            params=(("paths", paths), ("recursive", recursive), ("columns", columns), ("union_by_name", union_by_name))
+        )]
+        return DataFrame(self, plan, operation_history=history)
 
     def read_json(self, paths: Union[str, List[str]], schema: Dict[str, str]) -> DataFrame:
         """
@@ -520,7 +629,9 @@ class Session(SessionBase):
         """
         dataset = JsonDataSet(paths, schema)
         plan = DataSourceNode(self._ctx, dataset)
-        return DataFrame(self, plan)
+        # Record operation history for data source
+        history = [OperationRecord(operation="read_json", params=(("paths", paths), ("schema", schema)))]
+        return DataFrame(self, plan, operation_history=history)
 
     def from_items(self, items: List[Any]) -> DataFrame:
         """
@@ -530,23 +641,45 @@ class Session(SessionBase):
         assert isinstance(items, list), "items must be a list"
         assert len(items) > 0, "items must not be empty"
         if isinstance(items[0], dict):
-            return self.from_arrow(arrow.Table.from_pylist(items))
+            df = self.from_arrow(arrow.Table.from_pylist(items))
+            # Update history to reflect from_items instead of from_arrow
+            df._operation_history = [OperationRecord(
+                operation="from_items",
+                params=(("num_items", len(items)),)
+            )]
+            return df
         else:
-            return self.from_arrow(arrow.table({"item": items}))
+            df = self.from_arrow(arrow.table({"item": items}))
+            # Update history to reflect from_items instead of from_arrow
+            df._operation_history = [OperationRecord(
+                operation="from_items",
+                params=(("num_items", len(items)),)
+            )]
+            return df
 
     def from_pandas(self, df: pd.DataFrame) -> DataFrame:
         """
         Create a DataFrame from a pandas DataFrame.
         """
         plan = DataSourceNode(self._ctx, PandasDataSet(df))
-        return DataFrame(self, plan)
+        # Record operation history for data source
+        history = [OperationRecord(
+            operation="from_pandas",
+            params=(("shape", df.shape), ("columns", tuple(df.columns)))
+        )]
+        return DataFrame(self, plan, operation_history=history)
 
     def from_arrow(self, table: arrow.Table) -> DataFrame:
         """
         Create a DataFrame from a pyarrow Table.
         """
         plan = DataSourceNode(self._ctx, ArrowTableDataSet(table))
-        return DataFrame(self, plan)
+        # Record operation history for data source
+        history = [OperationRecord(
+            operation="from_arrow",
+            params=(("num_rows", table.num_rows), ("columns", tuple(table.column_names)))
+        )]
+        return DataFrame(self, plan, operation_history=history)
 
     def partial_sql(self, query: str, *inputs: DataFrame, **kwargs) -> DataFrame:
         """
@@ -568,7 +701,13 @@ class Session(SessionBase):
 
         plan = SqlEngineNode(self._ctx, tuple(input.plan for input in inputs), query, **kwargs)
         recompute = any(input.need_recompute for input in inputs)
-        return DataFrame(self, plan, recompute=recompute)
+        # Record operation history - only preserve the first input DataFrame's history
+        # Other input DataFrames' histories are not merged to keep the history linear
+        new_history: List[OperationRecord] = []
+        if inputs:
+            new_history = list(inputs[0]._operation_history)
+        new_history.append(OperationRecord(operation="partial_sql", params=(("query", query),)))
+        return DataFrame(self, plan, recompute=recompute, operation_history=new_history)
 
     def wait(self, *dfs: DataFrame):
         """
@@ -646,12 +785,82 @@ class Session(SessionBase):
 
 class DataFrame:
     """
-    A distributed data collection. It represents a 2 dimensional table of rows and columns.
+    A distributed data collection representing a 2-dimensional table of rows and columns.
 
-    Internally, it's a wrapper around a `Node` and a `Session` required for execution.
+    Internally, it's a wrapper around a `Node` (logical plan) and a `Session` required
+    for execution. DataFrames support lazy evaluation - transformations build up a
+    logical plan that is only executed when an action (like `count()`, `take()`, or
+    `to_pandas()`) is called.
+
+    Operation History Tracking
+    --------------------------
+    Each DataFrame maintains a history of dataset-level operations that were applied
+    to create it. This history is useful for:
+
+    - **Debugging**: Understanding what transformations led to the current state
+    - **Auditing**: Tracing the lineage of data transformations
+    - **Troubleshooting**: Identifying which operation might have caused unexpected results
+
+    **When tracking starts**: History tracking begins when a DataFrame is created from
+    a data source via Session methods (e.g., ``sp.read_parquet()``, ``sp.from_pandas()``).
+    The first entry in the history is always the data source operation.
+
+    **What is tracked**: Only dataset-level operations are tracked, including:
+
+    - Data sources: ``read_parquet``, ``read_csv``, ``read_json``, ``from_pandas``,
+      ``from_arrow``, ``from_items``, ``partial_sql``
+    - Transformations: ``filter``, ``map``, ``flat_map``, ``map_batches``, ``limit``
+    - Partitioning: ``repartition``, ``random_shuffle``, ``partial_sort``
+    - Multi-DataFrame: ``join``, ``union``, ``drop_duplicates``
+    - Aggregation: ``groupby_agg``
+    - Column operations: ``rename_columns``, ``drop_columns``, ``select_columns``
+    - Metadata: ``require_non_null``, ``recompute``, ``no_cache``
+
+    **What is NOT tracked**: Row-level operations are not tracked as they would
+    require significant code changes and memory overhead.
+
+    **History inheritance**: When a transformation is applied to a DataFrame, the
+    resulting DataFrame inherits the parent's history and adds the new operation.
+    For multi-DataFrame operations (join, union), only the calling (left) DataFrame's
+    history is preserved to maintain a simple, linear history.
+
+    **Immutability**: Each ``OperationRecord`` in the history is immutable (frozen
+    dataclass), ensuring the integrity of the recorded history.
+
+    Examples
+    --------
+    Access the operation history:
+
+    .. code-block::
+
+        df = (sp.read_parquet("data/*.parquet")
+              .filter("status = 'active'")
+              .repartition(10, hash_by="user_id"))
+
+        # View operation history
+        for record in df.history():
+            print(f"{record.operation}: {record.get_params()}")
+
+        # Output:
+        # read_parquet: {'paths': 'data/*.parquet', ...}
+        # filter: {'predicate': "status = 'active'"}
+        # repartition: {'npartitions': 10, 'hash_by': 'user_id', ...}
+
+    See Also
+    --------
+    history : Method to retrieve the operation history.
+    OperationRecord : The immutable dataclass representing a single operation record.
     """
 
-    def __init__(self, session: Session, plan: Node, recompute: bool = False, use_cache: bool = True, non_null_columns: Optional[frozenset] = None):
+    def __init__(
+        self,
+        session: Session,
+        plan: Node,
+        recompute: bool = False,
+        use_cache: bool = True,
+        non_null_columns: Optional[frozenset] = None,
+        operation_history: Optional[List[OperationRecord]] = None,
+    ):
         self.session = session
         self.plan = plan
         self.optimized_plan: Optional[Node] = None
@@ -670,11 +879,156 @@ class DataFrame:
         without copying. When new columns are added via require_non_null(), a new
         frozenset is created using union operation.
         """
+        self._operation_history: List[OperationRecord] = operation_history if operation_history is not None else []
+        """
+        History of dataset-level operations performed on this DataFrame.
+
+        This list tracks operations like filter, join, union, etc. that transform
+        the DataFrame at a dataset level. Row-level operations are not tracked.
+        The history is inherited from parent DataFrames and extended with new
+        operations, maintaining the full lineage of transformations.
+        """
 
         session._nodes.append(plan)
 
     def __str__(self) -> str:
         return repr(self.plan)
+
+    def _record_operation(
+        self,
+        operation: str,
+        params: Dict[str, Any],
+    ) -> List[OperationRecord]:
+        """
+        Create a new operation history by extending this DataFrame's history.
+
+        This helper method copies this DataFrame's operation history and appends
+        a new operation record. For multi-DataFrame operations (join, union),
+        only the calling DataFrame's history is preserved to maintain a simple,
+        linear history trace.
+
+        Parameters
+        ----------
+        operation : str
+            The name of the operation being performed.
+        params : Dict[str, Any]
+            The parameters for the operation. Callable values are converted to
+            '<function>' for readability, and DataFrame values are converted to
+            '<DataFrame>'.
+
+        Returns
+        -------
+        List[OperationRecord]
+            A new list containing this DataFrame's history plus the new operation record.
+
+        Notes
+        -----
+        For operations involving multiple DataFrames (e.g., join, union):
+        - Only the calling (left) DataFrame's history is preserved
+        - The other DataFrame(s)' histories are not merged
+        - This keeps the history as a simple linear sequence of operations
+
+        This design choice prioritizes simplicity and readability over completeness.
+        If you need to trace the full lineage of all involved DataFrames, inspect
+        each DataFrame's history separately before the multi-DataFrame operation.
+        """
+        # Sanitize params: convert callables to string representation
+        # and convert to tuple of tuples for immutability
+        sanitized_params = []
+        for k, v in params.items():
+            if callable(v):
+                sanitized_params.append((k, "<function>"))
+            elif isinstance(v, DataFrame):
+                sanitized_params.append((k, "<DataFrame>"))
+            else:
+                sanitized_params.append((k, v))
+
+        # Start with this DataFrame's history (only the calling DataFrame)
+        new_history = list(self._operation_history)
+
+        # Add the new operation record with params as immutable tuple
+        new_history.append(OperationRecord(operation=operation, params=tuple(sanitized_params)))
+
+        return new_history
+
+    def history(self) -> List[OperationRecord]:
+        """
+        Get the history of dataset-level operations performed on this DataFrame.
+
+        This method returns a list of operation records that trace the sequence of
+        transformations applied to create this DataFrame. Only dataset-level operations
+        are tracked (e.g., filter, join, union, repartition), not row-level operations.
+
+        The history forms a simple linear sequence of operations, starting from the
+        data source and including each transformation in order.
+
+        Returns
+        -------
+        List[OperationRecord]
+            A list of OperationRecord objects, each containing:
+            - operation: The name of the operation (e.g., 'filter', 'join')
+            - params: A tuple of (key, value) pairs for parameters. Use
+              ``record.get_params()`` to get as a dictionary.
+            - timestamp: When the operation was recorded
+
+        Examples
+        --------
+        View the operation history:
+
+        .. code-block::
+
+            df = (sp.read_parquet("data/*.parquet")
+                  .filter("status = 'active'")
+                  .repartition(10, hash_by="user_id")
+                  .join(other_df, on="user_id"))
+
+            for record in df.history():
+                print(f"{record.operation}: {record.get_params()}")
+
+        Output might look like:
+
+        .. code-block::
+
+            read_parquet: {'paths': 'data/*.parquet', ...}
+            filter: {'predicate': "status = 'active'"}
+            repartition: {'npartitions': 10, 'hash_by': 'user_id', ...}
+            join: {'on': 'user_id', 'how': 'inner', ...}
+
+        Check the number of operations:
+
+        .. code-block::
+
+            print(f"This DataFrame has {len(df.history())} operations in its history")
+
+        Notes
+        -----
+        - The history is a copy; modifying it does not affect the DataFrame.
+        - Operations are recorded at the time they are called, not when computed.
+        - **Multi-DataFrame operations (join, union)**: Only the calling (left)
+          DataFrame's history is preserved. The other DataFrame(s)' histories are
+          NOT merged. This keeps the history as a simple, linear sequence.
+
+          For example, if you call ``left_df.join(right_df, on="id")``, the resulting
+          DataFrame's history will contain ``left_df``'s history followed by the
+          join operation. ``right_df``'s history is not included.
+
+          If you need to trace the lineage of all involved DataFrames, inspect each
+          DataFrame's history separately before the operation.
+        - The following operations are tracked:
+          - Data sources: read_parquet, read_csv, read_json, from_pandas, from_arrow, from_items, partial_sql
+          - Transformations: filter, map, flat_map, map_batches, limit
+          - Partitioning: repartition, random_shuffle, partial_sort
+          - Multi-DataFrame: join, union, drop_duplicates
+          - Aggregation: groupby_agg
+          - Column operations: rename_columns, drop_columns, select_columns
+          - Metadata: require_non_null, recompute, no_cache
+
+        See Also
+        --------
+        OperationRecord : The dataclass representing a single operation record.
+        """
+        # Return a copy to prevent external modification
+        return list(self._operation_history)
 
     def _get_or_create_tasks(self) -> List[Task]:
         """
@@ -816,6 +1170,8 @@ class DataFrame:
                 logger.debug(f"Cleared cached result for {self.optimized_plan!r} due to recompute()")
 
         self.need_recompute = True
+        # Record operation history
+        self._operation_history.append(OperationRecord(operation="recompute", params=()))
         return self
 
     def no_cache(self) -> DataFrame:
@@ -841,6 +1197,8 @@ class DataFrame:
             df.map('a, b').no_cache().to_pandas()
         """
         self._use_cache = False
+        # Record operation history
+        self._operation_history.append(OperationRecord(operation="no_cache", params=()))
         return self
 
     def clear_cache(self) -> int:
@@ -1168,6 +1526,8 @@ class DataFrame:
         # frozenset is immutable, so this creates a new set rather than mutating
         self._non_null_columns = self._non_null_columns | frozenset(columns)
 
+        # Record operation history
+        self._operation_history.append(OperationRecord(operation="require_non_null", params=(("columns", tuple(columns)),)))
         return self
 
     def _validate_non_null_columns(self, datasets: List[DataSet]) -> None:
@@ -1262,7 +1622,12 @@ class DataFrame:
                 partition_by_rows=by_rows,
                 **kwargs,
             )
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
+        # Record operation history
+        new_history = self._record_operation(
+            "repartition",
+            {"npartitions": npartitions, "hash_by": hash_by, "by": by, "by_rows": by_rows}
+        )
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None, operation_history=new_history)
 
     def random_shuffle(self, **kwargs) -> DataFrame:
         """
@@ -1282,7 +1647,9 @@ class DataFrame:
             r"select * from {0} order by random()",
             **kwargs,
         )
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
+        # Record operation history
+        new_history = self._record_operation("random_shuffle", {})
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None, operation_history=new_history)
 
     def partial_sort(self, by: Union[str, List[str]], **kwargs) -> DataFrame:
         """
@@ -1308,7 +1675,9 @@ class DataFrame:
             f"select * from {{0}} order by {', '.join(by)}",
             **kwargs,
         )
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
+        # Record operation history
+        new_history = self._record_operation("partial_sort", {"by": by})
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None, operation_history=new_history)
 
     def filter(self, sql_or_func: Union[str, Callable[[Dict[str, Any]], bool]], **kwargs) -> DataFrame:
         """
@@ -1344,7 +1713,10 @@ class DataFrame:
             plan = ArrowBatchNode(self.session._ctx, (self.plan,), process_func=process_func, **kwargs)
         else:
             raise ValueError("condition must be a SQL expression or a predicate function")
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
+        # Record operation history - store the predicate (SQL string or function)
+        predicate_repr = sql_or_func if isinstance(sql_or_func, str) else sql_or_func
+        new_history = self._record_operation("filter", {"predicate": predicate_repr})
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None, operation_history=new_history)
 
     def map(
         self,
@@ -1404,7 +1776,10 @@ class DataFrame:
             plan = ArrowBatchNode(self.session._ctx, (self.plan,), process_func=process_func, **kwargs)
         else:
             raise ValueError(f"must be a SQL expression or a function: {sql_or_func!r}")
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
+        # Record operation history
+        expr_repr = sql_or_func if isinstance(sql_or_func, str) else sql_or_func
+        new_history = self._record_operation("map", {"expression": expr_repr})
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None, operation_history=new_history)
 
     def flat_map(
         self,
@@ -1445,7 +1820,10 @@ class DataFrame:
             plan = ArrowBatchNode(self.session._ctx, (self.plan,), process_func=process_func, **kwargs)
         else:
             raise ValueError(f"must be a SQL expression or a function: {sql_or_func!r}")
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
+        # Record operation history
+        expr_repr = sql_or_func if isinstance(sql_or_func, str) else sql_or_func
+        new_history = self._record_operation("flat_map", {"expression": expr_repr})
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None, operation_history=new_history)
 
     def map_batches(
         self,
@@ -1476,7 +1854,9 @@ class DataFrame:
             streaming_batch_size=batch_size,
             **kwargs,
         )
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
+        # Record operation history
+        new_history = self._record_operation("map_batches", {"func": func, "batch_size": batch_size})
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None, operation_history=new_history)
 
     def limit(self, limit: int) -> DataFrame:
         """
@@ -1485,7 +1865,9 @@ class DataFrame:
         Unlike `take`, this method doesn't trigger execution.
         """
         plan = LimitNode(self.session._ctx, self.plan, limit)
-        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
+        # Record operation history
+        new_history = self._record_operation("limit", {"limit": limit})
+        return DataFrame(self.session, plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None, operation_history=new_history)
 
     def join(
         self,
@@ -1588,6 +1970,11 @@ class DataFrame:
           partitioning to ensure that matching rows end up in the same partition.
         - For cross joins, no repartitioning is performed since all combinations are needed.
         - The join is executed partition-by-partition using DuckDB SQL.
+        - **Operation history**: The resulting DataFrame's history contains only the left
+          (calling) DataFrame's history, followed by the join operation. The right DataFrame's
+          (``other``) history is NOT included. This keeps the history as a simple, linear
+          sequence. If you need to trace the lineage of both DataFrames, inspect each
+          DataFrame's ``history()`` separately before the join.
         """
         # Validate join type
         valid_join_types = {"inner", "left", "right", "outer", "full", "cross", "semi", "anti"}
@@ -1660,7 +2047,13 @@ class DataFrame:
         recompute = self.need_recompute or other.need_recompute
         # Merge non-null columns from both DataFrames using frozenset union
         merged_non_null = self._non_null_columns | other._non_null_columns
-        return DataFrame(self.session, plan, recompute=recompute, use_cache=self._use_cache, non_null_columns=merged_non_null if merged_non_null else None)
+        # Record operation history - only preserve the left (calling) DataFrame's history
+        # The right DataFrame's history is not merged to keep the history linear
+        new_history = self._record_operation(
+            "join",
+            {"on": on, "left_on": left_on, "right_on": right_on, "how": how, "npartitions": npartitions}
+        )
+        return DataFrame(self.session, plan, recompute=recompute, use_cache=self._use_cache, non_null_columns=merged_non_null if merged_non_null else None, operation_history=new_history)
 
     def _build_join_sql(
         self,
@@ -1844,6 +2237,13 @@ class DataFrame:
           the schema cannot be determined without computation, validation will occur
           at compute time.
 
+        - **Operation history**: The resulting DataFrame's history contains only the
+          calling DataFrame's (``self``) history, followed by the union operation.
+          The other DataFrames' (``others``) histories are NOT included. This keeps
+          the history as a simple, linear sequence. If you need to trace the lineage
+          of all involved DataFrames, inspect each DataFrame's ``history()`` separately
+          before the union.
+
         See Also
         --------
         join : Combine DataFrames horizontally based on key columns.
@@ -1881,7 +2281,13 @@ class DataFrame:
 
         # Build the union using SQL UNION ALL
         # Use UNION ALL to keep all rows (including duplicates) and preserve partitioning
-        return self._build_union(all_dfs)
+        # Record operation history - only preserve the calling DataFrame's history
+        # Other DataFrames' histories are not merged to keep the history linear
+        new_history = self._record_operation(
+            "union",
+            {"num_dataframes": len(others)}
+        )
+        return self._build_union(all_dfs, new_history)
 
     def drop_duplicates(
         self,
@@ -2066,12 +2472,18 @@ class DataFrame:
             sql,
         )
 
+        # Record operation history
+        new_history = self._record_operation(
+            "drop_duplicates",
+            {"subset": subset, "keep": keep, "npartitions": npartitions}
+        )
         return DataFrame(
             self.session,
             plan,
             recompute=self.need_recompute,
             use_cache=self._use_cache,
-            non_null_columns=self._non_null_columns if self._non_null_columns else None
+            non_null_columns=self._non_null_columns if self._non_null_columns else None,
+            operation_history=new_history
         )
 
     @staticmethod
@@ -2338,7 +2750,7 @@ class DataFrame:
                     }
                 )
 
-    def _build_union(self, dfs: List["DataFrame"]) -> "DataFrame":
+    def _build_union(self, dfs: List["DataFrame"], operation_history: Optional[List[OperationRecord]] = None) -> "DataFrame":
         """
         Build the union of multiple DataFrames.
 
@@ -2350,6 +2762,8 @@ class DataFrame:
         ----------
         dfs : List[DataFrame]
             The DataFrames to union.
+        operation_history : List[OperationRecord], optional
+            The operation history for the resulting DataFrame.
 
         Returns
         -------
@@ -2397,7 +2811,8 @@ class DataFrame:
             plan,
             recompute=recompute,
             use_cache=use_cache,
-            non_null_columns=merged_non_null if merged_non_null else None
+            non_null_columns=merged_non_null if merged_non_null else None,
+            operation_history=operation_history
         )
 
     def groupby_agg(
@@ -2561,7 +2976,12 @@ class DataFrame:
             final_agg_sql,
         )
 
-        return DataFrame(self.session, final_plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None)
+        # Record operation history
+        new_history = self._record_operation(
+            "groupby_agg",
+            {"by": by, "aggs": aggs, "npartitions": npartitions}
+        )
+        return DataFrame(self.session, final_plan, recompute=self.need_recompute, use_cache=self._use_cache, non_null_columns=self._non_null_columns if self._non_null_columns else None, operation_history=new_history)
 
     def _build_groupby_agg_sql(
         self,
@@ -3275,12 +3695,15 @@ class DataFrame:
             mapping.get(col, col) for col in self._non_null_columns
         )
 
+        # Record operation history
+        new_history = self._record_operation("rename_columns", {"mapping": mapping})
         return DataFrame(
             self.session,
             plan,
             recompute=self.need_recompute,
             use_cache=self._use_cache,
-            non_null_columns=new_non_null if new_non_null else None
+            non_null_columns=new_non_null if new_non_null else None,
+            operation_history=new_history
         )
 
     def drop_columns(self, columns: Union[str, List[str]]) -> "DataFrame":
@@ -3378,12 +3801,15 @@ class DataFrame:
         # Update non-null columns by removing dropped columns
         new_non_null = self._non_null_columns - frozenset(cols_to_drop)
 
+        # Record operation history
+        new_history = self._record_operation("drop_columns", {"columns": columns})
         return DataFrame(
             self.session,
             plan,
             recompute=self.need_recompute,
             use_cache=self._use_cache,
-            non_null_columns=new_non_null if new_non_null else None
+            non_null_columns=new_non_null if new_non_null else None,
+            operation_history=new_history
         )
 
     def select_columns(self, columns: List[str]) -> "DataFrame":
@@ -3482,12 +3908,15 @@ class DataFrame:
         # Update non-null columns to only include selected columns
         new_non_null = self._non_null_columns & frozenset(columns)
 
+        # Record operation history
+        new_history = self._record_operation("select_columns", {"columns": columns})
         return DataFrame(
             self.session,
             plan,
             recompute=self.need_recompute,
             use_cache=self._use_cache,
-            non_null_columns=new_non_null if new_non_null else None
+            non_null_columns=new_non_null if new_non_null else None,
+            operation_history=new_history
         )
 
     def sample(
