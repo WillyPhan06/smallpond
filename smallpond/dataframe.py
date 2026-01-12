@@ -1007,6 +1007,53 @@ class DataFrame:
 
         return None
 
+    def _validate_columns_exist(
+        self,
+        columns: Union[str, List[str], set],
+        operation_name: str
+    ) -> Optional[List[str]]:
+        """
+        Validate that specified columns exist in the DataFrame.
+
+        This is a helper method used by column operations (rename_columns, drop_columns,
+        select_columns) to validate column existence early when possible.
+
+        Parameters
+        ----------
+        columns : str, List[str], or set
+            The column(s) to validate.
+        operation_name : str
+            The name of the operation for error messages (e.g., "rename", "drop", "select").
+
+        Returns
+        -------
+        Optional[List[str]]
+            The available columns if schema can be determined, None otherwise.
+
+        Raises
+        ------
+        ValueError
+            If any specified column doesn't exist in the DataFrame (when schema is available).
+        """
+        # Normalize to set for validation
+        if isinstance(columns, str):
+            cols_set = {columns}
+        elif isinstance(columns, set):
+            cols_set = columns
+        else:
+            cols_set = set(columns)
+
+        available_columns = self._try_get_column_names()
+        if available_columns is not None:
+            missing_cols = cols_set - set(available_columns)
+            if missing_cols:
+                raise ValueError(
+                    f"Columns to {operation_name} not found in DataFrame: {sorted(missing_cols)}. "
+                    f"Available columns: {available_columns}"
+                )
+
+        return available_columns
+
     def require_non_null(self, columns: Union[str, List[str]]) -> DataFrame:
         """
         Mark columns as required to be non-null.
@@ -3130,6 +3177,318 @@ class DataFrame:
 
         # Should not reach here, but return max as fallback
         return tdigest["max"]
+
+    def rename_columns(self, mapping: Dict[str, str]) -> "DataFrame":
+        """
+        Rename columns according to the provided mapping.
+
+        This method creates a new DataFrame with specified columns renamed. Columns
+        not included in the mapping retain their original names. This is a convenient
+        alternative to using `map()` with SQL when you just need to rename columns.
+
+        Parameters
+        ----------
+        mapping : Dict[str, str]
+            A dictionary mapping old column names to new column names.
+            Keys are the current column names, values are the desired new names.
+            Only columns that need to be renamed should be included.
+
+        Returns
+        -------
+        DataFrame
+            A new DataFrame with the specified columns renamed.
+
+        Raises
+        ------
+        ValueError
+            If any column name in the mapping keys doesn't exist in the DataFrame
+            (when column names can be determined without computation).
+            If the mapping is empty.
+
+        Examples
+        --------
+        Rename a single column:
+
+        .. code-block::
+
+            df_renamed = df.rename_columns({"old_name": "new_name"})
+
+        Rename multiple columns:
+
+        .. code-block::
+
+            df_renamed = df.rename_columns({
+                "id": "user_id",
+                "name": "user_name",
+                "ts": "timestamp"
+            })
+
+        Chain with other operations:
+
+        .. code-block::
+
+            result = (df
+                .filter("status = 'active'")
+                .rename_columns({"id": "user_id"})
+                .map("user_id, email"))
+
+        Notes
+        -----
+        - This operation is lazy and does not trigger computation.
+        - Non-null column requirements are automatically updated to use the new
+          column names. If you had `require_non_null("id")` and rename "id" to
+          "user_id", the non-null requirement will apply to "user_id".
+        - Column order is preserved after renaming.
+
+        See Also
+        --------
+        drop_columns : Remove columns from the DataFrame.
+        select_columns : Select and reorder columns.
+        map : Apply transformations including column selection and renaming via SQL.
+        """
+        if not mapping:
+            raise ValueError("mapping cannot be empty. Provide at least one column to rename.")
+
+        # Validate columns exist early (when possible without triggering computation)
+        available_columns = self._validate_columns_exist(set(mapping.keys()), "rename")
+
+        if available_columns is not None:
+            # Build SELECT with renamed columns preserving order
+            select_parts = []
+            for col in available_columns:
+                if col in mapping:
+                    select_parts.append(f'"{col}" AS "{mapping[col]}"')
+                else:
+                    select_parts.append(f'"{col}"')
+
+            sql = f"SELECT {', '.join(select_parts)} FROM {{0}}"
+        else:
+            # Schema not available - use DuckDB's REPLACE syntax which renames columns
+            # while keeping all other columns. This works at compute time when schema is unknown.
+            rename_exprs = ", ".join(f'"{old}" AS "{new}"' for old, new in mapping.items())
+            sql = f"SELECT * REPLACE ({rename_exprs}) FROM {{0}}"
+
+        plan = SqlEngineNode(self.session._ctx, (self.plan,), sql)
+
+        # Update non-null columns with renamed column names
+        new_non_null = frozenset(
+            mapping.get(col, col) for col in self._non_null_columns
+        )
+
+        return DataFrame(
+            self.session,
+            plan,
+            recompute=self.need_recompute,
+            use_cache=self._use_cache,
+            non_null_columns=new_non_null if new_non_null else None
+        )
+
+    def drop_columns(self, columns: Union[str, List[str]]) -> "DataFrame":
+        """
+        Remove specified columns from the DataFrame.
+
+        This method creates a new DataFrame with the specified columns removed.
+        This is a convenient alternative to using `map()` with SQL when you just
+        need to drop some columns.
+
+        Parameters
+        ----------
+        columns : str or List[str]
+            A single column name or a list of column names to drop.
+
+        Returns
+        -------
+        DataFrame
+            A new DataFrame without the specified columns.
+
+        Raises
+        ------
+        ValueError
+            If any column name doesn't exist in the DataFrame (when column names
+            can be determined without computation).
+            If trying to drop all columns.
+
+        Examples
+        --------
+        Drop a single column:
+
+        .. code-block::
+
+            df_slim = df.drop_columns("unnecessary_column")
+
+        Drop multiple columns:
+
+        .. code-block::
+
+            df_slim = df.drop_columns(["temp_col1", "temp_col2", "debug_info"])
+
+        Chain with other operations:
+
+        .. code-block::
+
+            result = (df
+                .filter("status = 'active'")
+                .drop_columns(["internal_id", "created_at"])
+                .write_parquet("output"))
+
+        Notes
+        -----
+        - This operation is lazy and does not trigger computation.
+        - Non-null column requirements for dropped columns are automatically removed.
+        - Column order of remaining columns is preserved.
+
+        See Also
+        --------
+        rename_columns : Rename columns in the DataFrame.
+        select_columns : Select and reorder columns (can also be used to drop columns).
+        map : Apply transformations including column selection via SQL.
+        """
+        # Normalize to list
+        if isinstance(columns, str):
+            cols_to_drop = [columns]
+        else:
+            cols_to_drop = list(columns)
+
+        if not cols_to_drop:
+            raise ValueError("Must specify at least one column to drop.")
+
+        cols_to_drop_set = set(cols_to_drop)
+
+        # Validate columns exist early (when possible without triggering computation)
+        available_columns = self._validate_columns_exist(cols_to_drop_set, "drop")
+
+        if available_columns is not None:
+            # Check we're not dropping all columns
+            remaining_cols = [col for col in available_columns if col not in cols_to_drop_set]
+            if not remaining_cols:
+                raise ValueError(
+                    "Cannot drop all columns. At least one column must remain in the DataFrame."
+                )
+
+            # Build SELECT with remaining columns preserving order
+            quoted_cols = ", ".join(f'"{col}"' for col in remaining_cols)
+            sql = f"SELECT {quoted_cols} FROM {{0}}"
+        else:
+            # Schema not available - use DuckDB's EXCLUDE syntax to exclude specified columns
+            excluded_cols = ", ".join(f'"{col}"' for col in cols_to_drop)
+            sql = f"SELECT * EXCLUDE ({excluded_cols}) FROM {{0}}"
+
+        plan = SqlEngineNode(self.session._ctx, (self.plan,), sql)
+
+        # Update non-null columns by removing dropped columns
+        new_non_null = self._non_null_columns - frozenset(cols_to_drop)
+
+        return DataFrame(
+            self.session,
+            plan,
+            recompute=self.need_recompute,
+            use_cache=self._use_cache,
+            non_null_columns=new_non_null if new_non_null else None
+        )
+
+    def select_columns(self, columns: List[str]) -> "DataFrame":
+        """
+        Select and reorder columns in the DataFrame.
+
+        This method creates a new DataFrame containing only the specified columns
+        in the specified order. This is useful for:
+        - Reordering columns to a desired sequence
+        - Selecting a subset of columns
+        - Both reordering and subsetting at once
+
+        Parameters
+        ----------
+        columns : List[str]
+            A list of column names in the desired order. Only these columns
+            will be included in the resulting DataFrame, in this exact order.
+
+        Returns
+        -------
+        DataFrame
+            A new DataFrame with only the specified columns in the specified order.
+
+        Raises
+        ------
+        ValueError
+            If any column name doesn't exist in the DataFrame (when column names
+            can be determined without computation).
+            If the columns list is empty.
+            If duplicate column names are specified.
+
+        Examples
+        --------
+        Reorder columns:
+
+        .. code-block::
+
+            # Original columns: [id, name, email, created_at]
+            # Desired order: [name, email, id, created_at]
+            df_reordered = df.select_columns(["name", "email", "id", "created_at"])
+
+        Select a subset of columns in a specific order:
+
+        .. code-block::
+
+            # Only keep id, name, and email columns
+            df_subset = df.select_columns(["id", "name", "email"])
+
+        Chain with other operations:
+
+        .. code-block::
+
+            result = (df
+                .filter("status = 'active'")
+                .select_columns(["user_id", "email", "name"])
+                .rename_columns({"user_id": "id"}))
+
+        Notes
+        -----
+        - This operation is lazy and does not trigger computation.
+        - Non-null column requirements for columns not in the selection are
+          automatically removed.
+        - Unlike `drop_columns()`, this method lets you specify exactly which
+          columns you want and in what order.
+        - If you just want to select columns without changing order, you can
+          also use `map("col1, col2, col3")` with SQL syntax.
+
+        See Also
+        --------
+        rename_columns : Rename columns in the DataFrame.
+        drop_columns : Remove columns from the DataFrame.
+        map : Apply transformations including column selection via SQL.
+        """
+        if not columns:
+            raise ValueError("columns list cannot be empty. Specify at least one column.")
+
+        # Check for duplicates
+        if len(columns) != len(set(columns)):
+            seen = set()
+            duplicates = []
+            for col in columns:
+                if col in seen:
+                    duplicates.append(col)
+                seen.add(col)
+            raise ValueError(f"Duplicate column names specified: {duplicates}")
+
+        # Validate columns exist early (when possible without triggering computation)
+        self._validate_columns_exist(columns, "select")
+
+        # Build SELECT with columns in specified order
+        quoted_cols = ", ".join(f'"{col}"' for col in columns)
+        sql = f"SELECT {quoted_cols} FROM {{0}}"
+
+        plan = SqlEngineNode(self.session._ctx, (self.plan,), sql)
+
+        # Update non-null columns to only include selected columns
+        new_non_null = self._non_null_columns & frozenset(columns)
+
+        return DataFrame(
+            self.session,
+            plan,
+            recompute=self.need_recompute,
+            use_cache=self._use_cache,
+            non_null_columns=new_non_null if new_non_null else None
+        )
 
     def sample(
         self,

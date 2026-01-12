@@ -3364,3 +3364,653 @@ def test_drop_duplicates_default_keeps_first(sp: Session):
     assert rows[0]["id"] == 1
     # First occurrence (value=100) should be kept, matching pandas behavior
     assert rows[0]["value"] == 100
+
+
+# ==================== Column Operations Tests ====================
+
+
+def test_rename_columns_single(sp: Session):
+    """Test renaming a single column."""
+    df = sp.from_arrow(pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]}))
+    result = df.rename_columns({"id": "user_id"})
+    rows = result.take_all()
+
+    assert len(rows) == 3
+    assert "user_id" in rows[0]
+    assert "id" not in rows[0]
+    assert "name" in rows[0]
+    assert rows[0]["user_id"] == 1
+
+
+def test_rename_columns_multiple(sp: Session):
+    """Test renaming multiple columns at once."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2],
+        "name": ["Alice", "Bob"],
+        "ts": [100, 200]
+    }))
+    result = df.rename_columns({
+        "id": "user_id",
+        "name": "user_name",
+        "ts": "timestamp"
+    })
+    rows = result.take_all()
+
+    assert len(rows) == 2
+    assert set(rows[0].keys()) == {"user_id", "user_name", "timestamp"}
+    assert rows[0]["user_id"] == 1
+    assert rows[0]["user_name"] == "Alice"
+    assert rows[0]["timestamp"] == 100
+
+
+def test_rename_columns_preserves_order(sp: Session):
+    """Test that rename_columns preserves column order."""
+    df = sp.from_arrow(pa.table({
+        "z": [1],
+        "a": [2],
+        "m": [3]
+    }))
+    result = df.rename_columns({"a": "alpha"})
+    arrow_table = result.to_arrow()
+
+    # Column order should be preserved: z, alpha, m
+    column_names = [field.name for field in arrow_table.schema]
+    assert column_names == ["z", "alpha", "m"]
+
+
+def test_rename_columns_validation_empty_mapping(sp: Session):
+    """Test that empty mapping raises ValueError."""
+    df = sp.from_arrow(pa.table({"id": [1, 2, 3]}))
+    with pytest.raises(ValueError, match="mapping cannot be empty"):
+        df.rename_columns({})
+
+
+def test_rename_columns_validation_nonexistent_column(sp: Session):
+    """Test that renaming nonexistent column raises ValueError."""
+    df = sp.from_arrow(pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]}))
+    with pytest.raises(ValueError, match="Columns to rename not found"):
+        df.rename_columns({"nonexistent": "new_name"})
+
+
+def test_rename_columns_updates_non_null_requirements(sp: Session):
+    """Test that non-null requirements are updated with new column names."""
+    from smallpond.dataframe import NullValidationError
+
+    df = sp.from_arrow(pa.table({
+        "id": pa.array([1, None, 3], type=pa.int64()),
+        "value": [10, 20, 30]
+    }))
+    df = df.require_non_null("id")
+    result = df.rename_columns({"id": "user_id"})
+
+    # The non-null requirement should apply to the new column name
+    assert "user_id" in result._non_null_columns
+    assert "id" not in result._non_null_columns
+
+    with pytest.raises(NullValidationError) as exc_info:
+        result.count()
+    assert "user_id" in exc_info.value.columns
+
+
+def test_rename_columns_chain_operations(sp: Session):
+    """Test chaining rename_columns with other operations."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2, 3, 4, 5],
+        "value": [10, 20, 30, 40, 50]
+    }))
+    result = (df
+        .filter("value > 20")
+        .rename_columns({"id": "user_id"})
+        .map("user_id, value * 2 as doubled"))
+    rows = sorted(result.take_all(), key=lambda x: x["user_id"])
+
+    assert len(rows) == 3
+    assert rows[0] == {"user_id": 3, "doubled": 60}
+
+
+def test_drop_columns_single(sp: Session):
+    """Test dropping a single column."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2, 3],
+        "name": ["a", "b", "c"],
+        "temp": [True, False, True]
+    }))
+    result = df.drop_columns("temp")
+    rows = result.take_all()
+
+    assert len(rows) == 3
+    assert set(rows[0].keys()) == {"id", "name"}
+    assert "temp" not in rows[0]
+
+
+def test_drop_columns_multiple(sp: Session):
+    """Test dropping multiple columns at once."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2],
+        "name": ["a", "b"],
+        "temp1": [True, False],
+        "temp2": [100, 200],
+        "temp3": ["x", "y"]
+    }))
+    result = df.drop_columns(["temp1", "temp2", "temp3"])
+    rows = result.take_all()
+
+    assert len(rows) == 2
+    assert set(rows[0].keys()) == {"id", "name"}
+
+
+def test_drop_columns_preserves_order(sp: Session):
+    """Test that drop_columns preserves order of remaining columns."""
+    df = sp.from_arrow(pa.table({
+        "z": [1],
+        "a": [2],
+        "m": [3],
+        "b": [4]
+    }))
+    result = df.drop_columns("a")
+    arrow_table = result.to_arrow()
+
+    column_names = [field.name for field in arrow_table.schema]
+    assert column_names == ["z", "m", "b"]
+
+
+def test_drop_columns_validation_nonexistent_column(sp: Session):
+    """Test that dropping nonexistent column raises ValueError."""
+    df = sp.from_arrow(pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]}))
+    with pytest.raises(ValueError, match="Columns to drop not found"):
+        df.drop_columns("nonexistent")
+
+
+def test_drop_columns_validation_drop_all_columns(sp: Session):
+    """Test that dropping all columns raises ValueError."""
+    df = sp.from_arrow(pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]}))
+    with pytest.raises(ValueError, match="Cannot drop all columns"):
+        df.drop_columns(["id", "name"])
+
+
+def test_drop_columns_updates_non_null_requirements(sp: Session):
+    """Test that non-null requirements are removed for dropped columns."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2, 3],
+        "name": ["a", "b", "c"],
+        "value": [10, 20, 30]
+    }))
+    df = df.require_non_null(["id", "name"])
+    result = df.drop_columns("name")
+
+    # Non-null requirement for 'name' should be removed, 'id' should remain
+    assert "id" in result._non_null_columns
+    assert "name" not in result._non_null_columns
+
+
+def test_drop_columns_chain_operations(sp: Session):
+    """Test chaining drop_columns with other operations."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2, 3, 4, 5],
+        "value": [10, 20, 30, 40, 50],
+        "internal_id": [100, 200, 300, 400, 500]
+    }))
+    result = (df
+        .filter("value > 20")
+        .drop_columns("internal_id")
+        .map("id, value"))
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+
+    assert len(rows) == 3
+    assert set(rows[0].keys()) == {"id", "value"}
+
+
+def test_select_columns_subset(sp: Session):
+    """Test selecting a subset of columns."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2, 3],
+        "name": ["a", "b", "c"],
+        "email": ["a@test.com", "b@test.com", "c@test.com"],
+        "value": [10, 20, 30]
+    }))
+    result = df.select_columns(["id", "name"])
+    rows = result.take_all()
+
+    assert len(rows) == 3
+    assert set(rows[0].keys()) == {"id", "name"}
+
+
+def test_select_columns_reorder(sp: Session):
+    """Test reordering columns."""
+    df = sp.from_arrow(pa.table({
+        "id": [1],
+        "name": ["a"],
+        "email": ["a@test.com"]
+    }))
+    result = df.select_columns(["email", "name", "id"])
+    arrow_table = result.to_arrow()
+
+    column_names = [field.name for field in arrow_table.schema]
+    assert column_names == ["email", "name", "id"]
+
+
+def test_select_columns_subset_and_reorder(sp: Session):
+    """Test selecting a subset of columns in a different order."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2],
+        "name": ["a", "b"],
+        "email": ["a@test.com", "b@test.com"],
+        "created_at": [100, 200]
+    }))
+    result = df.select_columns(["name", "id"])
+    arrow_table = result.to_arrow()
+
+    column_names = [field.name for field in arrow_table.schema]
+    assert column_names == ["name", "id"]
+    rows = result.take_all()
+    assert rows[0] == {"name": "a", "id": 1}
+
+
+def test_select_columns_validation_empty_list(sp: Session):
+    """Test that empty columns list raises ValueError."""
+    df = sp.from_arrow(pa.table({"id": [1, 2, 3]}))
+    with pytest.raises(ValueError, match="columns list cannot be empty"):
+        df.select_columns([])
+
+
+def test_select_columns_validation_nonexistent_column(sp: Session):
+    """Test that selecting nonexistent column raises ValueError."""
+    df = sp.from_arrow(pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]}))
+    with pytest.raises(ValueError, match="Columns not found"):
+        df.select_columns(["id", "nonexistent"])
+
+
+def test_select_columns_validation_duplicate_columns(sp: Session):
+    """Test that duplicate column names raise ValueError."""
+    df = sp.from_arrow(pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]}))
+    with pytest.raises(ValueError, match="Duplicate column names"):
+        df.select_columns(["id", "name", "id"])
+
+
+def test_select_columns_updates_non_null_requirements(sp: Session):
+    """Test that non-null requirements are updated for selected columns only."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2, 3],
+        "name": ["a", "b", "c"],
+        "value": [10, 20, 30]
+    }))
+    df = df.require_non_null(["id", "name", "value"])
+    result = df.select_columns(["id", "value"])
+
+    # Only 'id' and 'value' non-null requirements should remain
+    assert "id" in result._non_null_columns
+    assert "value" in result._non_null_columns
+    assert "name" not in result._non_null_columns
+
+
+def test_select_columns_chain_operations(sp: Session):
+    """Test chaining select_columns with other operations."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2, 3, 4, 5],
+        "name": ["a", "b", "c", "d", "e"],
+        "value": [10, 20, 30, 40, 50]
+    }))
+    result = (df
+        .filter("value > 20")
+        .select_columns(["name", "value"])
+        .rename_columns({"name": "user_name"}))
+    rows = sorted(result.take_all(), key=lambda x: x["value"])
+
+    assert len(rows) == 3
+    assert set(rows[0].keys()) == {"user_name", "value"}
+    assert rows[0]["user_name"] == "c"
+
+
+def test_column_operations_combined(sp: Session):
+    """Test combining all column operations in a single pipeline."""
+    df = sp.from_arrow(pa.table({
+        "id": [1, 2, 3],
+        "first_name": ["Alice", "Bob", "Carol"],
+        "last_name": ["Smith", "Jones", "Brown"],
+        "internal_code": [100, 200, 300],
+        "debug_flag": [True, False, True]
+    }))
+
+    result = (df
+        .drop_columns(["internal_code", "debug_flag"])  # Remove internal columns
+        .rename_columns({"first_name": "name"})  # Simplify column name
+        .select_columns(["name", "last_name", "id"]))  # Reorder columns
+
+    arrow_table = result.to_arrow()
+    column_names = [field.name for field in arrow_table.schema]
+    assert column_names == ["name", "last_name", "id"]
+
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+    assert rows[0] == {"name": "Alice", "last_name": "Smith", "id": 1}
+
+
+def test_column_operations_with_partitioned_data(sp: Session):
+    """Test column operations on partitioned DataFrames."""
+    df = sp.from_items([
+        {"id": i, "name": f"user_{i}", "value": i * 10, "temp": i}
+        for i in range(100)
+    ]).repartition(5, by_rows=True)
+
+    result = (df
+        .drop_columns("temp")
+        .rename_columns({"id": "user_id"})
+        .select_columns(["value", "user_id", "name"]))
+
+    rows = sorted(result.take_all(), key=lambda x: x["user_id"])
+    assert len(rows) == 100
+    assert set(rows[0].keys()) == {"value", "user_id", "name"}
+    assert rows[0]["user_id"] == 0
+    assert rows[0]["value"] == 0
+
+
+def test_rename_columns_preserves_cache_setting(sp: Session):
+    """Test that rename_columns inherits cache setting."""
+    df = sp.from_arrow(pa.table({"id": [1, 2]})).no_cache()
+    result = df.rename_columns({"id": "user_id"})
+    assert result._use_cache is False
+
+
+def test_drop_columns_preserves_cache_setting(sp: Session):
+    """Test that drop_columns inherits cache setting."""
+    df = sp.from_arrow(pa.table({"id": [1, 2], "temp": [3, 4]})).no_cache()
+    result = df.drop_columns("temp")
+    assert result._use_cache is False
+
+
+def test_select_columns_preserves_cache_setting(sp: Session):
+    """Test that select_columns inherits cache setting."""
+    df = sp.from_arrow(pa.table({"id": [1, 2], "name": ["a", "b"]})).no_cache()
+    result = df.select_columns(["id"])
+    assert result._use_cache is False
+
+
+def test_rename_columns_fallback_when_schema_unavailable(sp: Session):
+    """Test rename_columns works correctly when schema cannot be determined early.
+
+    When a DataFrame has undergone transformations that prevent early schema detection
+    (like map operations), rename_columns falls back to using DuckDB's REPLACE syntax.
+    This test verifies that the fallback path works correctly.
+    """
+    # Create a DataFrame and apply a map transformation that changes the schema
+    # This makes _try_get_column_names() return None
+    df = sp.from_arrow(pa.table({"a": [1, 2, 3], "b": [4, 5, 6]}))
+    # map() with SQL changes the output schema, so _try_get_column_names returns None
+    df_mapped = df.map("a + b as c, a * b as d")
+
+    # Verify schema is not available (this is the precondition for the fallback path)
+    # The mapped DataFrame should return None for _try_get_column_names
+    assert df_mapped._try_get_column_names() is None
+
+    # Now test rename_columns on this DataFrame - it should use the REPLACE syntax fallback
+    result = df_mapped.rename_columns({"c": "sum_col", "d": "product_col"})
+
+    # Verify the rename worked correctly
+    rows = sorted(result.take_all(), key=lambda x: x["sum_col"])
+
+    assert len(rows) == 3
+    # Row 1: a=1, b=4 -> c=5, d=4 -> sum_col=5, product_col=4
+    assert rows[0] == {"sum_col": 5, "product_col": 4}
+    # Row 2: a=2, b=5 -> c=7, d=10 -> sum_col=7, product_col=10
+    assert rows[1] == {"sum_col": 7, "product_col": 10}
+    # Row 3: a=3, b=6 -> c=9, d=18 -> sum_col=9, product_col=18
+    assert rows[2] == {"sum_col": 9, "product_col": 18}
+
+
+def test_drop_columns_fallback_when_schema_unavailable(sp: Session):
+    """Test drop_columns works correctly when schema cannot be determined early.
+
+    When a DataFrame has undergone transformations that prevent early schema detection,
+    drop_columns falls back to using DuckDB's EXCLUDE syntax.
+    """
+    df = sp.from_arrow(pa.table({"a": [1, 2, 3], "b": [4, 5, 6]}))
+    df_mapped = df.map("a, b, a + b as c")
+
+    # Verify schema is not available
+    assert df_mapped._try_get_column_names() is None
+
+    # Now test drop_columns - it should use the EXCLUDE syntax fallback
+    result = df_mapped.drop_columns("c")
+
+    rows = sorted(result.take_all(), key=lambda x: x["a"])
+
+    assert len(rows) == 3
+    # Only 'a' and 'b' columns should remain
+    assert set(rows[0].keys()) == {"a", "b"}
+    assert rows[0] == {"a": 1, "b": 4}
+
+
+def test_select_columns_fallback_when_schema_unavailable(sp: Session):
+    """Test select_columns works correctly when schema cannot be determined early.
+
+    When schema detection fails, select_columns still generates valid SQL
+    since it just uses the specified column names directly.
+    """
+    df = sp.from_arrow(pa.table({"a": [1, 2, 3], "b": [4, 5, 6]}))
+    df_mapped = df.map("a, b, a + b as c")
+
+    # Verify schema is not available
+    assert df_mapped._try_get_column_names() is None
+
+    # Now test select_columns - should work fine even without schema
+    result = df_mapped.select_columns(["c", "a"])
+
+    rows = sorted(result.take_all(), key=lambda x: x["a"])
+
+    assert len(rows) == 3
+    # Columns should be in specified order: c, a
+    arrow_table = result.to_arrow()
+    column_names = [field.name for field in arrow_table.schema]
+    assert column_names == ["c", "a"]
+
+    assert rows[0] == {"c": 5, "a": 1}
+    assert rows[1] == {"c": 7, "a": 2}
+    assert rows[2] == {"c": 9, "a": 3}
+
+
+def test_column_operations_integration_with_non_null_validation(sp: Session):
+    """Integration test: combine all 3 column operations with non-null validation.
+
+    This test simulates a real-world scenario where:
+    1. A DataFrame has non-null requirements on certain columns
+    2. Some columns are dropped (including one with non-null requirement)
+    3. Remaining columns are renamed (including one with non-null requirement)
+    4. Columns are reordered
+    5. Non-null validation still works correctly on the final result
+    """
+    from smallpond.dataframe import NullValidationError
+
+    # Create DataFrame with some null values
+    df = sp.from_arrow(pa.table({
+        "user_id": pa.array([1, 2, 3, 4, 5], type=pa.int64()),
+        "name": ["Alice", "Bob", "Carol", "Dave", "Eve"],
+        "email": pa.array(["a@test.com", None, "c@test.com", "d@test.com", "e@test.com"]),
+        "internal_id": [100, 200, 300, 400, 500],
+        "debug_flag": [True, False, True, False, True],
+        "score": pa.array([90, 85, None, 95, 88], type=pa.int64())
+    }))
+
+    # Set non-null requirements on multiple columns
+    df = df.require_non_null(["user_id", "email", "score"])
+
+    # Step 1: Drop internal columns (debug_flag has no non-null requirement)
+    df_step1 = df.drop_columns(["internal_id", "debug_flag"])
+
+    # Verify non-null requirements are preserved after drop
+    assert "user_id" in df_step1._non_null_columns
+    assert "email" in df_step1._non_null_columns
+    assert "score" in df_step1._non_null_columns
+
+    # Step 2: Rename columns
+    df_step2 = df_step1.rename_columns({
+        "user_id": "id",
+        "email": "contact_email",
+        "score": "final_score"
+    })
+
+    # Verify non-null requirements are updated with new names
+    assert "id" in df_step2._non_null_columns
+    assert "contact_email" in df_step2._non_null_columns
+    assert "final_score" in df_step2._non_null_columns
+    assert "user_id" not in df_step2._non_null_columns
+    assert "email" not in df_step2._non_null_columns
+    assert "score" not in df_step2._non_null_columns
+
+    # Step 3: Reorder columns
+    df_final = df_step2.select_columns(["name", "contact_email", "final_score", "id"])
+
+    # Verify non-null requirements are preserved after reorder
+    assert "id" in df_final._non_null_columns
+    assert "contact_email" in df_final._non_null_columns
+    assert "final_score" in df_final._non_null_columns
+
+    # Verify column order
+    arrow_table = df_final.to_arrow()
+    column_names = [field.name for field in arrow_table.schema]
+    assert column_names == ["name", "contact_email", "final_score", "id"]
+
+    # Step 4: Verify non-null validation still works - should fail due to nulls in email and score
+    with pytest.raises(NullValidationError) as exc_info:
+        df_final.count()
+
+    # Check that the error mentions the renamed columns
+    assert "contact_email" in exc_info.value.columns or "final_score" in exc_info.value.columns
+
+
+def test_column_operations_integration_happy_path(sp: Session):
+    """Integration test: combine all 3 column operations on valid data.
+
+    This test verifies that the full pipeline works correctly when data is valid.
+    """
+    # Create DataFrame without null values in required columns
+    df = sp.from_arrow(pa.table({
+        "user_id": [1, 2, 3],
+        "first_name": ["Alice", "Bob", "Carol"],
+        "last_name": ["Smith", "Jones", "Brown"],
+        "email": ["a@test.com", "b@test.com", "c@test.com"],
+        "internal_code": [100, 200, 300],
+        "temp_flag": [True, False, True]
+    }))
+
+    # Set non-null requirements
+    df = df.require_non_null(["user_id", "email"])
+
+    # Pipeline: drop -> rename -> reorder
+    result = (df
+        .drop_columns(["internal_code", "temp_flag"])
+        .rename_columns({
+            "user_id": "id",
+            "first_name": "name",
+            "email": "contact"
+        })
+        .select_columns(["name", "last_name", "contact", "id"]))
+
+    # Verify non-null requirements are correctly tracked
+    assert "id" in result._non_null_columns
+    assert "contact" in result._non_null_columns
+
+    # Verify the result
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+
+    assert len(rows) == 3
+    assert rows[0] == {"name": "Alice", "last_name": "Smith", "contact": "a@test.com", "id": 1}
+    assert rows[1] == {"name": "Bob", "last_name": "Jones", "contact": "b@test.com", "id": 2}
+    assert rows[2] == {"name": "Carol", "last_name": "Brown", "contact": "c@test.com", "id": 3}
+
+    # Verify column order
+    arrow_table = result.to_arrow()
+    column_names = [field.name for field in arrow_table.schema]
+    assert column_names == ["name", "last_name", "contact", "id"]
+
+    # Verify count works (non-null validation passes)
+    assert result.count() == 3
+
+
+def test_rename_columns_to_existing_name(sp: Session):
+    """Test that renaming a column to a name that already exists causes an error.
+
+    This is an edge case where a user tries to rename column 'a' to 'b',
+    but 'b' already exists in the DataFrame. This should cause an error
+    at compute time because it would result in duplicate column names.
+    """
+    df = sp.from_arrow(pa.table({
+        "a": [1, 2, 3],
+        "b": [4, 5, 6],
+        "c": [7, 8, 9]
+    }))
+
+    # Rename 'a' to 'b' - this should cause an issue since 'b' already exists
+    result = df.rename_columns({"a": "b"})
+
+    # The error should occur at compute time when DuckDB tries to execute the query
+    # because the resulting table would have duplicate column names
+    with pytest.raises(Exception):
+        # This should fail because we'd have two columns named 'b'
+        result.take_all()
+
+
+def test_rename_columns_swap_names(sp: Session):
+    """Test that swapping column names works correctly.
+
+    This tests the case where we want to swap names of two columns,
+    e.g., rename 'a' to 'b' and 'b' to 'a' at the same time.
+    """
+    df = sp.from_arrow(pa.table({
+        "a": [1, 2, 3],
+        "b": [4, 5, 6]
+    }))
+
+    # Swap column names in a single operation
+    result = df.rename_columns({"a": "b", "b": "a"})
+
+    rows = sorted(result.take_all(), key=lambda x: x["a"])
+
+    # After swap: original 'b' column is now 'a', original 'a' column is now 'b'
+    # So sorting by new 'a' (which was original 'b') gives us [4,5,6] order
+    assert len(rows) == 3
+    # Row with a=4 (originally b=4) should have b=1 (originally a=1)
+    assert rows[0] == {"a": 4, "b": 1}
+    assert rows[1] == {"a": 5, "b": 2}
+    assert rows[2] == {"a": 6, "b": 3}
+
+
+def test_column_operations_with_filter_and_aggregation(sp: Session):
+    """Integration test: column operations combined with filter and aggregation.
+
+    This tests a more complex real-world scenario where column operations
+    are used in conjunction with other DataFrame operations.
+    """
+    df = sp.from_arrow(pa.table({
+        "department": ["Engineering", "Engineering", "Sales", "Sales", "HR"],
+        "employee_id": [1, 2, 3, 4, 5],
+        "employee_name": ["Alice", "Bob", "Carol", "Dave", "Eve"],
+        "salary": [100000, 90000, 80000, 85000, 70000],
+        "internal_rating": [5, 4, 4, 3, 5]
+    }))
+
+    # Pipeline: filter -> drop -> rename -> select
+    result = (df
+        .filter("salary >= 80000")
+        .drop_columns("internal_rating")
+        .rename_columns({
+            "employee_id": "id",
+            "employee_name": "name",
+            "department": "dept"
+        })
+        .select_columns(["dept", "name", "salary", "id"]))
+
+    rows = sorted(result.take_all(), key=lambda x: x["id"])
+
+    # Should have 4 employees with salary >= 80000
+    assert len(rows) == 4
+    assert set(rows[0].keys()) == {"dept", "name", "salary", "id"}
+
+    # Verify column order
+    arrow_table = result.to_arrow()
+    column_names = [field.name for field in arrow_table.schema]
+    assert column_names == ["dept", "name", "salary", "id"]
+
+    # Verify data
+    assert rows[0] == {"dept": "Engineering", "name": "Alice", "salary": 100000, "id": 1}
+    assert rows[1] == {"dept": "Engineering", "name": "Bob", "salary": 90000, "id": 2}
+    assert rows[2] == {"dept": "Sales", "name": "Carol", "salary": 80000, "id": 3}
+    assert rows[3] == {"dept": "Sales", "name": "Dave", "salary": 85000, "id": 4}
